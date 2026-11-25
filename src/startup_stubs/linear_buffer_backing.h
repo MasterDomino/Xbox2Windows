@@ -115,6 +115,7 @@
 //     refresh-gpu-written  a copied buffer that a recorded copy wrote is still refreshed
 //     gpuw-at-record   the buffer stops being refreshed when the copy is recorded, not when it is submitted
 //     skip-producer-wait  a refresh does not Wait for earlier submissions (it may overwrite a backing in use)
+//     publish-out-of-order  an older refresh's span is applied to `uploaded` after a newer one's
 //   x2w_d3d12_linear_buffer_internal_queue  returns the internal queue, so a fixture can hold refreshes
 //   X2W_TEST_LINEAR_STAGING_LIMIT=<n>      the staging pool holds n buffers instead of 256
 //   X2W_TEST_LINEAR_REFRESH_FAIL=<n>       staging requests 2, 2 + n, 2 + 2n, ... fail with E_OUTOFMEMORY
@@ -558,6 +559,7 @@ private:
         std::vector<unsigned char> bound;     // skip-refresh mutant: the bytes at placement
         UINT64 refreshes = 0, bytes_copied = 0, last_staging = 0, refresh_failures = 0;
         UINT64 refresh_value = 0;  // internal fence value of the last enqueued refresh
+        UINT64 published_value = 0;  // internal fence value of the newest refresh published into `uploaded`
         bool stale = false;
         bool gpu_written = false;  // a recorded copy wrote it: not refreshed any more
         HRESULT last_refresh_hr = S_OK;
@@ -801,12 +803,15 @@ private:
             }
         }
 
-        // Publish under the lock. Two submissions that snapshot the same buffer concurrently can both
-        // copy the same changed span and publish `uploaded` in either order, so `uploaded` may briefly
-        // lag what the GPU already holds. The next submission then compares the title against an older
-        // upload and copies a span that is redundant or larger than needed, never one that misses a
-        // change, so the cost is an extra refresh, not stale data. Every consumer waits for the higher
-        // of the two fence values.
+        // Publish under the lock. Two submissions on different threads can snapshot one buffer against the
+        // same `uploaded`, stage the title's bytes at different times (X, then the CPU writes Y, then Y),
+        // execute in one order (internal_mutex_: Y gets the lower value, X the higher, so the backing ends
+        // with X) and publish in the other. Applying both publishes in lock order would leave `uploaded`
+        // saying Y while the backing holds X, and no later submission would refresh it. So a buffer
+        // remembers the internal value of its last applied publish: a newer one applies its span; an older
+        // one arriving after it drops `uploaded` (the backing holds the newer copy's bytes where the spans
+        // overlap and the older one's elsewhere), and the next submission copies the whole buffer. Every
+        // consumer waits for the higher of the two fence values.
         std::lock_guard lock(mutex_);
         // Executed without a fence value: what it read can never be proven free, so it stays in use.
         const UINT64 held = executed ? ~UINT64{0} : 0;
@@ -822,15 +827,23 @@ private:
             w.staging->value = value;
             Copied& copy = *w.copy;
             if (value > copy.refresh_value) copy.refresh_value = value;
-            if (copy.live) {
-                // The backing holds these bytes once `value` completes; every consumer waits for it.
+            if (copy.live && value < copy.published_value && !linear_detail::mutant("publish-out-of-order")) {
+                copy.uploaded.clear();  // an older copy after a newer one: unknown, the next submission copies it all
+                ++totals_.reordered_publishes;
+            } else if (copy.live) {
+                // The backing holds these bytes once `value` completes; every consumer waits for it. An unknown
+                // `uploaded` (empty) is set only by a copy of the whole buffer.
+                const bool whole = w.offset == 0 && w.bytes == copy.bytes;
                 try {
-                    if (copy.uploaded.size() != copy.bytes) copy.uploaded.assign(static_cast<std::size_t>(copy.bytes), 0);
-                    std::memcpy(copy.uploaded.data() + w.offset, w.staging->mapped, static_cast<std::size_t>(w.bytes));
+                    if (copy.uploaded.size() != copy.bytes && (whole || linear_detail::mutant("publish-out-of-order")))
+                        copy.uploaded.assign(static_cast<std::size_t>(copy.bytes), 0);
+                    if (copy.uploaded.size() == copy.bytes)
+                        std::memcpy(copy.uploaded.data() + w.offset, w.staging->mapped, static_cast<std::size_t>(w.bytes));
                 } catch (const std::bad_alloc&) {
                     copy.uploaded.clear();  // the next submission copies the whole buffer again
                 }
             }
+            if (value > copy.published_value) copy.published_value = value;
             copy.stale = false;
             ++copy.refreshes;
             copy.bytes_copied += w.bytes;

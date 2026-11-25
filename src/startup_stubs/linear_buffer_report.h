@@ -33,5 +33,6 @@ struct X2wLinearBufferTotals {
     std::uint64_t gpu_written;      // copied buffers that a submitted copy wrote (held from then on)
     std::uint64_t producer_waits;   // refresh copies made to Wait for a queue's earlier, uncompleted submission
     std::uint64_t producer_wait_skips;  // queues a refresh did not wait for (behind an unreached title Wait)
+    std::uint64_t reordered_publishes;  // an older refresh published after a newer one: `uploaded` dropped
     std::int32_t last_refusal_hr, last_refresh_hr;
 };
