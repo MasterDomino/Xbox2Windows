@@ -400,7 +400,11 @@ public:
             }
         }
 
-        // Publish under the lock.
+        // Publish under the lock. Two submissions that snapshot the same buffer concurrently can both
+        // copy the same changed span and publish `uploaded` in either order, so `uploaded` may briefly
+        // lag what the GPU already holds. The next submission then compares the title against an older
+        // upload and copies a span that is redundant or larger than needed, never one that misses a
+        // change, so the cost is an extra refresh, not stale data.
         std::lock_guard lock(mutex_);
         if (list && FAILED(list_hr)) list->value = 0;
         for (Work& w : work) {
