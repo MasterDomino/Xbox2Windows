@@ -84,10 +84,11 @@
 //   war  (copy only) a read of A on queue 1 behind a title gate (on the desktop queue); the CPU writes B and
 //        queue 2 submits a read. Its refresh's copy waits for queue 1 (producer_waits): queue 2 cannot
 //        complete while the gate is closed, queue 1 reads A and queue 2 reads B.
-//   xq.write (copy only) queue 1 waits through its wrapper (slot 17) on a title fence, then submits a read;
-//        the CPU writes B and queue 2 submits a read. The refresh must not wait for queue 1 (counted as a
-//        producer wait skip): queue 2 completes while queue 1 still waits, then the CPU reaches the fence
-//        and queue 1 reads B too.
+//   xq.write (copy only) queue 1 waits through its wrapper (slot 17) on a title fence, then submits a read of
+//        A; the CPU writes B and queue 2 submits a read. Its refresh has no safe completion order (it would
+//        have to wait for queue 1, behind the unreached fence), so the submission is refused: unsafe refresh
+//        refusals +1 and logged, its result slot keeps P. The title's Signal through queue 2's wrapper (slot
+//        16) releases queue 1, which reads A; the refused recording submitted again on queue 2 reads B.
 //   order (copy only) two threads refresh one buffer, parked through x2w_d3d12_linear_buffer_test_pause:
 //        thread A stages C and parks before its copy executes; the CPU writes D; thread B stages D, executes
 //        first and parks before publishing; A executes (the backing ends with C) and publishes, B publishes
@@ -113,7 +114,8 @@
 //   gpuw-at-record (copy) case gpuw.discard (the buffer stops being refreshed when the copy is recorded),
 //   skip-producer-wait (copy) case war (the refresh's copy lands before queue 1's earlier read),
 //   publish-out-of-order (copy) case order (B's older publish is applied after A's: no further refresh),
-//   copy-after-retire (copy) case retire (no probe before staging: the fault guard catches the read).
+//   copy-after-retire (copy) case retire (no probe before staging: the fault guard catches the read),
+//   accept-unsafe-refresh (copy) case xq.write (the refresh skips the blocked queue: queue 2 runs and both read B).
 //
 // Refreshes run on an internal COPY queue that the DLL exports to fixtures
 // (x2w_d3d12_linear_buffer_internal_queue); cases c, contention and gate2q.held hold it behind a fence
@@ -521,6 +523,19 @@ struct Gpu {
             readback->Unmap(0, &none);
         }
         return got;
+    }
+    // The CPU writes `tag` ^ key into result slot `slot` (indexed as the region at r0), so a read that never
+    // ran leaves it there.
+    bool fill_output(UINT slot, Tag tag)
+    {
+        void* mapped = nullptr;
+        const D3D12_RANGE none{0, 0};
+        if (FAILED(readback->Map(0, &none, &mapped))) return false;
+        auto* w = reinterpret_cast<std::uint32_t*>(static_cast<std::uint8_t*>(mapped) + slot * region_bytes);
+        for (UINT i = 0; i < words; ++i) w[i] = pattern(tag, r0 / 4 + i) ^ key;
+        const D3D12_RANGE written{slot * region_bytes, (slot + 1) * region_bytes};
+        readback->Unmap(0, &written);
+        return true;
     }
     unsigned debug_errors()
     {
@@ -1199,10 +1214,13 @@ struct Run {
                 std::to_string(after.producer_waits - before.producer_waits));
     }
 
-    // xq.write: queue 1 waits through its wrapper (queue slot 17) on a title fence, then submits a read; the CPU
-    // writes B and queue 2 submits a read. The refresh must not wait for queue 1 (the fence is reached only
-    // later, here by the CPU once queue 2 is done; a title can equally signal it from queue 2): queue 2 completes
-    // while queue 1 still waits, both read B, and the skip is counted.
+    // xq.write: queue 1 waits through its wrapper (queue slot 17) on a title fence F, then submits a read of A
+    // (nothing to refresh). The CPU writes B and queue 2 submits a read. Its refresh would have to wait for
+    // queue 1, which sits behind F, and F may be reached only by later work (here the title signals it from
+    // queue 2): there is no safe completion order, so the submission must be refused, with nothing of it
+    // executed (its result slot keeps the fixture's P) and the refusal counted and logged. The title then
+    // signals F through queue 2's wrapper (queue slot 16): queue 1 must complete and read A. The refused
+    // recording, submitted again on queue 2 once queue 1 is done, must read B, with no further refusal.
     void case_xq_write(Pool& pool)
     {
         const char* name = "xq.write";
@@ -1219,31 +1237,47 @@ struct Run {
             return row(pool, name, false, "slot 133 -> " + hex(x.hr));
         l0.read(x.backing.Get());
         l0.close();
-        if (!gpu.wait(l0.submit())) return row(pool, name, false, "fence timeout");
+        if (!gpu.wait(l0.submit())) return row(pool, name, false, "fence timeout");  // A uploaded and read
         l1.read(x.backing.Get(), 1);
         l1.close();
         l2.read(x.backing.Get(), 2);
         l2.close();
+        if (!gpu.fill_output(2, P)) return row(pool, name, false, "result slot could not be filled");
         const X2wLinearBufferTotals before = totals();
         if (FAILED(static_cast<HRESULT>(invoke(gpu.guest_queue.Get(), 17, arg(fence.Get()), 1))))
             return row(pool, name, false, "queue wait (slot 17) failed");
-        const UINT64 v1 = l1.submit();
+        const UINT64 v1 = l1.submit();  // queue 1, behind F
         write(memory.buffer(), r0, B, words);
-        const UINT64 v2 = l2.submit_on(q2);
-        const bool q2_done = wait_fence(q2.fence.Get(), v2);
+        const UINT64 v2 = l2.submit_on(q2);  // needs a refresh of B: refused
+        // The lane's own fence after the refused lists: queue 2 itself was never blocked.
+        const bool q2_progress = wait_fence(q2.fence.Get(), v2);
         const bool q1_pending = gpu.done->GetCompletedValue() < v1;
-        invoke(fence.Get(), 10, 1);  // the title's fence, from the CPU (fence slot 10)
+        const X2wLinearBufferTotals mid = totals();
+        const Tally refused = tally(gpu.read_output(2).data(), r0 / 4, key);
+        const bool logged = log_has("refused: its refresh would have to wait for queue", "no safe completion order");
+        // The title's ordinary Signal through queue 2's wrapper releases queue 1.
+        const HRESULT signal_hr = static_cast<HRESULT>(invoke(q2.guest.Get(), 16, arg(fence.Get()), 1));
         const bool q1_done = gpu.wait(v1);
-        if (!q2_done && !wait_fence(q2.fence.Get(), v2)) return row(pool, name, false, "fence timeout (queue 2)");
-        const Tally t1 = tally(gpu.read_output(1).data(), r0 / 4, key), t2 = tally(gpu.read_output(2).data(), r0 / 4, key);
+        if (!q1_done) return row(pool, name, false, "queue 1 did not complete after the title's Signal (slot 16) " + hex(signal_hr));
+        const Tally t1 = tally(gpu.read_output(1).data(), r0 / 4, key);
+        // A later, safe submission: the refused recording again, with no submission behind a title Wait.
+        const UINT64 v3 = l2.submit_on(q2);
+        if (!wait_fence(q2.fence.Get(), v3)) return row(pool, name, false, "fence timeout (queue 2, resubmission)");
+        const Tally t2 = tally(gpu.read_output(2).data(), r0 / 4, key);
+        refresh_info(x);
         const X2wLinearBufferTotals after = totals();
-        const bool pass = q2_done && q1_pending && q1_done && t1.count[B] == words && t2.count[B] == words &&
-                          after.producer_wait_skips > before.producer_wait_skips;
+        const UINT64 refusals = mid.unsafe_refresh_refusals - before.unsafe_refresh_refusals;
+        const bool pass = q1_pending && q2_progress && refusals == 1 && refused.count[P] == words && logged && SUCCEEDED(signal_hr) &&
+                          t1.count[A] == words && t2.count[B] == words && after.unsafe_refresh_refusals == mid.unsafe_refresh_refusals &&
+                          !x.info.stale && x.info.refresh_failures == 0;
         row(pool, name, pass,
-            std::string("queue 1 behind a title Wait (slot 17); queue 2 ") +
-                (q2_done ? "completed" : "DID NOT COMPLETE (the refresh waited for queue 1: deadlock)") + " while queue 1 " +
-                (q1_pending ? "still waited" : "HAD RUN") + " and read " + t2.text() + "; queue 1 " + (q1_done ? "then read " : "DID NOT COMPLETE, read ") +
-                t1.text() + "; producer wait skips +" + std::to_string(after.producer_wait_skips - before.producer_wait_skips));
+            std::string("queue 1 ") + (q1_pending ? "behind a title Wait (slot 17)" : "NOT HELD by its title Wait") +
+                " with a read of A; after the CPU wrote B, queue 2's read was " + (refusals == 1 ? "refused" : "NOT REFUSED") +
+                " (refusals +" + std::to_string(refusals) + ", log line " + (logged ? "present" : "MISSING") + "), its slot " +
+                refused.text() + " (expected P: nothing ran), queue 2 " + (q2_progress ? "progressed" : "STUCK") +
+                "; the title's Signal on queue 2 (slot 16) -> " + hex(signal_hr) + ", queue 1 then read " + t1.text() +
+                " (expected A); the refused recording resubmitted on queue 2 read " + t2.text() + " (expected B), refusals +" +
+                std::to_string(after.unsafe_refresh_refusals - mid.unsafe_refresh_refusals) + (x.info.stale ? ", STALE" : ""));
     }
 
     // order: two threads' refreshes of one buffer, driven through the pause hook. Thread A stages C and parks
@@ -1730,7 +1764,7 @@ int main(int argc, char** argv)
     std::printf("totals: placements %llu (shared %llu, copied %llu, kept default %llu), feature queries %llu, heap opens %llu "
                 "(failed %llu, cache hits %llu), placements failed %llu, submissions %llu, refreshes %llu, bytes copied %llu, "
                 "staging created %llu reused %llu, unreadable %llu, refresh failures %llu, consumer waits %llu, producer waits %llu "
-                "(skipped %llu), gpu written %llu, reordered publishes %llu, copy faults %llu, last refusal %s, last refresh failure %s\n",
+                "(unsafe refreshes refused %llu), gpu written %llu, reordered publishes %llu, copy faults %llu, last refusal %s, last refresh failure %s\n",
                 static_cast<unsigned long long>(t.placements), static_cast<unsigned long long>(t.shared),
                 static_cast<unsigned long long>(t.copied), static_cast<unsigned long long>(t.kept_default),
                 static_cast<unsigned long long>(t.feature_queries), static_cast<unsigned long long>(t.heap_opens),
@@ -1740,7 +1774,7 @@ int main(int argc, char** argv)
                 static_cast<unsigned long long>(t.staging_created), static_cast<unsigned long long>(t.staging_reused),
                 static_cast<unsigned long long>(t.unreadable), static_cast<unsigned long long>(t.refresh_failures),
                 static_cast<unsigned long long>(t.consumer_waits), static_cast<unsigned long long>(t.producer_waits),
-                static_cast<unsigned long long>(t.producer_wait_skips), static_cast<unsigned long long>(t.gpu_written),
+                static_cast<unsigned long long>(t.unsafe_refresh_refusals), static_cast<unsigned long long>(t.gpu_written),
                 static_cast<unsigned long long>(t.reordered_publishes), static_cast<unsigned long long>(t.copy_faults),
                 hex(t.last_refusal_hr).c_str(), hex(t.last_refresh_hr).c_str());
     {
@@ -1781,7 +1815,7 @@ int main(int argc, char** argv)
                            : mutant == "hold-lock" ? "contention" : mutant == "skip-consumer-wait" ? "gate2q.held"
                            : mutant == "refresh-gpu-written" ? "gpuw" : mutant == "gpuw-at-record" ? "gpuw.discard"
                            : mutant == "skip-producer-wait" ? "war" : mutant == "publish-out-of-order" ? "order"
-                           : mutant == "copy-after-retire" ? "retire" : nullptr;
+                           : mutant == "copy-after-retire" ? "retire" : mutant == "accept-unsafe-refresh" ? "xq.write" : nullptr;
         if (!target) return 2;
         unsigned targeted = 0, failed = 0;
         for (const auto& [name, pass] : run.results)

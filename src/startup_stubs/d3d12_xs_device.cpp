@@ -3529,10 +3529,14 @@ bool console_layout_srv(const D3D12_RESOURCE_DESC& desc);
 
 // X2W_D3D12_LINEAR_BUFFERS: the copied linear buffers are refreshed from title memory on the internal
 // refresh queue, and queue waits for those refreshes, just before the title's lists. A refresh that
-// fails leaves that buffer stale (logged, counted); the lists run either way.
-void linear_refresh(ID3D12CommandQueue* queue)
+// fails leaves that buffer stale (logged, counted); the lists run either way. False: a refresh had no
+// safe completion order and the submission is refused (logged, counted): nothing was enqueued, and the
+// caller drops the title's lists without executing them or committing their bookkeeping. The title's
+// fence Signal and Wait on its queues stay as they are, so a later Signal still releases a queue that
+// waits on it.
+bool linear_refresh(ID3D12CommandQueue* queue)
 {
-    if (x2w_startup::linear_buffer_mode() != x2w_startup::LinearBufferMode::off) linear_buffers().before_submit(queue);
+    return x2w_startup::linear_buffer_mode() == x2w_startup::LinearBufferMode::off || linear_buffers().before_submit(queue);
 }
 // After the title's lists on queue: a later refresh's copy waits for this submission (the producer wait).
 void linear_submitted(ID3D12CommandQueue* queue)
@@ -3552,8 +3556,9 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
         std::vector<Wrapper*> submitted;
         auto* queue = static_cast<ID3D12CommandQueue*>(self->own().real);
         // Before the wrapper's locks: a refresh may wait for a staging fence, and recording must not
-        // wait with it.
-        if (count) linear_refresh(queue);
+        // wait with it. A refused submission runs nothing: its recordings stay closed and submittable,
+        // with their pending GPU writes (committed only after an executed submission).
+        if (count && !linear_refresh(queue)) return;
         // Pin the closed recording and its allocator through submission bookkeeping.
         AcquireSRWLockExclusive(&draw_lock);
         AcquireSRWLockExclusive(&allocator_lock);
@@ -3615,7 +3620,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
     std::vector<ID3D12CommandList*> real(count);
     for (UINT i = 0; i < count; ++i) real[i] = reinterpret_cast<ID3D12CommandList*>(unwrap(reinterpret_cast<u64>(lists[i])));
     auto* queue = static_cast<ID3D12CommandQueue*>(self->own().real);
-    linear_refresh(queue);
+    if (!linear_refresh(queue)) return;
     queue->ExecuteCommandLists(count, real.data());
     if (count) linear_submitted(queue);
     if (first_calls(calls)) log("x2w-d3d12 CommandQueue::ExecuteCommandLists count=%u", count);
@@ -3734,7 +3739,8 @@ u64 __stdcall queue_wait(Wrapper* self, u64 rdx, u64 r8, u64 r9)
     if (!fence || fence->own().kind != fence_kind) return queue_dynamic<17>(self, rdx, r8, r9);
     InterlockedExchange(&self->own().queue_wait_seen, 1);
     const HRESULT hr = static_cast<ID3D12CommandQueue*>(self->own().real)->Wait(static_cast<ID3D12Fence*>(fence->own().real), r8);
-    // X2W_D3D12_LINEAR_BUFFERS: a refresh does not wait for a submission behind this wait until it is reached.
+    // X2W_D3D12_LINEAR_BUFFERS: until this wait is reached, a submission whose refresh would have to wait for a
+    // submission behind it is refused.
     if (SUCCEEDED(hr) && x2w_startup::linear_buffer_mode() != x2w_startup::LinearBufferMode::off)
         linear_buffers().note_title_wait(static_cast<ID3D12CommandQueue*>(self->own().real), static_cast<ID3D12Fence*>(fence->own().real), r8);
     static LONG calls;
