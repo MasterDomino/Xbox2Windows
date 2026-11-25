@@ -9657,6 +9657,46 @@ cmake --build --preset release --target startup_indirect_draw_indexed startup_li
 ctest --preset release --no-tests=error -j1 -R '^(xmem_section_lease_|xmem_shim_(exports|mapped_pages|page_runs)$|startup_(mesh_xmem_writer|mesh86_srv_proof|list_copy|list_resubmit.*_warp$))' --output-on-failure
 ```
 
+#### Production slice: slot 133 linear buffers (#1914)
+
+The first production change wires the #1942 comparison to one buffer kind in `d3d12_xs.dll`: device slot 133 (`CreatePlacedResourceX`) with a buffer description and initial state `COMMON`. The title writes such a buffer with the CPU and the GPU reads it as vertex, index, constant, shader-resource or indirect-argument data. The behaviour is opt-in through `X2W_D3D12_LINEAR_BUFFERS`; unset, slot 133 keeps its backing (see [Linear buffer backing](startup-runtime.md#linear-buffer-backing-device-slot-133-opt-in)). `src/startup_stubs/linear_buffer_backing.h` shares a buffer in a private allocation after `D3D12_FEATURE_EXISTING_HEAPS`. It copies any other buffer from title memory at each submission through the queue wrapper, and refuses with a defined HRESULT where the copy cannot keep the guarantees.
+
+`tests/linear_buffer_backing_check.cpp` drives the production entry points: slot 133 on the device wrapper, list Reset (139) and Close (9) on wrapper lists recorded on their desktop lists, and `ExecuteCommandLists` (queue slot 10) on the queue wrapper, in render mode. It reuses #1942's sentinels and cases. The GPU reads the buffer through a root SRV and writes it through a root UAV. Title memory is either `xmem.dll` physical pages (64 KiB slots of 256 MiB sections, `X2W_XMEM_SHARED_VIEWS=1`) or one committed private range. The buffer sits at offset `0x30000` behind three neighbour pages, and the first XMem buffer lands on slots that a previous user freed, which must read zero. Each run sets its own environment. The path is one of `default` (unset), `share` (`=1`), `copy` (`=copy`), `refusal` (`=1` with `X2W_TEST_EXISTING_HEAPS_UNSUPPORTED=1`, as on an adapter with `EXISTING_HEAPS = 0`) and `untracked` (`=copy` with `X2W_TEST_SUBMIT_FENCE_FAIL=1`).
+
+| Case | Sequence and oracle |
+|---|---|
+| a | Slot 133 and a list that reads the buffer are recorded over A; the CPU writes B before `ExecuteCommandLists`. The GPU must read B in all 1,024 words. |
+| a2 | 16 words then change to E. The next submission must read them, and a copy must move only those 64 bytes. |
+| b | A GPU-written use (`ALLOW_UNORDERED_ACCESS`). The GPU writes G ^ key; after the fence the CPU alias must hold it and the rest of the buffer its filler. A copy must refuse. |
+| c | Three submissions (B, C, D, each its own buffer) are held on a gate fence; each must read its own sentinel. Sharing: the title releases X while it is held, and after the fence places E at X's address. Copying: no staging buffer may be handed out twice while held, and after the fence the next refresh must take one of them again. |
+| d1 | After a refreshed submission of A the CPU writes B, and the list runs on the desktop queue directly, past the wrapper. A copy must expose the stale A; sharing reads B. Through the wrapper, B. |
+| d2 | As b, held on the gate. Before it opens, the fence must be incomplete and the alias must hold P in every word; after it, G ^ key. |
+| split | `share` only: a buffer across two XMem views is copied, and must read B. |
+| gate | `refusal` only: one feature query and no heap open. |
+| off | `default` only: none of the linear-buffer code ran. |
+
+On Windows 11 build 26300 at `19e04be9` plus this change, the results were identical on in-box WARP (`1414:008c`, driver 10.0.26100.9818) and an AMD Radeon RX 9070 XT (`1002:7550`, driver 32.0.31044.16), with the debug layer off and on (`X2W_TEST_DEBUG_LAYER=1`, no errors stored). Both adapters report `D3D12_FEATURE_EXISTING_HEAPS`. All five paths pass with no skips. Bytes are those copied from title memory into the backing; HRESULTs are the slot 133 result and the sharing result.
+
+| Path | Pool | Backing | Slot 133 / sharing HRESULT | Bytes copied | Results |
+|---|---|---|---|---|---|
+| `default` | XMem | committed default buffer, not aliased (old behaviour) | `S_OK` / not attempted | 0 | a reads zero in all words; b leaves P |
+| `default` | private | aliased through the cached heap (old behaviour) | `S_OK` / not attempted | 0 | a B; b G ^ key; no linear-buffer code ran |
+| `share` | private | title memory, one heap opened for the range (generation 1, 7 cache hits) | `S_OK` / `S_OK` | 0 | a B; a2 E; b G ^ key; c B, C, D, then E at X's address on the same heap; d1 B both ways; d2 P before the fence, then G ^ key |
+| `share` | XMem | copied | `S_OK` / `0x80070032` (view), `0x80070057` (split) | a 131,072; a2 64; split 131,072; c 4 × 131,072; d1 131,072 + 4,096 | as `copy`; b and d2 refused with `0x80070032` |
+| `copy` | XMem, private | committed default buffer refreshed at submit | `S_OK` / not attempted | a 131,072; a2 64; c 4 × 131,072; d1 131,072 + 4,096 | a B; a2 E; c B, C, D on staging 1, 2, 3, then staging 1 again after the fence; d1 stale A past the wrapper, B through it; b and d2 refused with `0x887A0004` |
+| `refusal` | XMem, private | as `copy` | `S_OK` / `0x887A0004` from the feature gate, no heap opened | as `copy` | as `copy`; b and d2 refused with `0x887A0004` |
+| `untracked` | XMem, private | none | `0x8007139F` (`E_NOT_VALID_STATE`) for a; `0x887A0004` for b and d2 | 0 | refused, no resource created |
+
+The run also measures why an XMem view is not shared, and does not assert it. On both adapters `OpenExistingHeapFromAddress` accepts the five-page view and a buffer places at `+0x30000` (`S_OK`). While they live, XMem's unmap of those pages fails with error 87 (`x2w-xmem unmap of 5 page(s) failed`). After they are released it succeeds and the pages are freed. Desktop resources live for the process, so sharing a view would keep the title from ever unmapping or freeing those pages.
+
+Four negative controls each set `X2W_TEST_LINEAR_BUFFER_MUTANT`, which removes one guarantee inside `d3d12_xs.dll`. Each must fail its case in both pools, and on both adapters each does:
+- `skip-refresh` takes the copy at placement (bind) and never at submit, so a reads A (2 of 2) and d1 reads A through the wrapper.
+- `reuse-early` hands out staging buffers without their fence. All three held refreshes share staging 1, and X, Y and Z all read D (2 of 2).
+- `copy-gpu-writes` lets the copy accept a GPU-written use. b and d2 leave P in the alias (2 of 2).
+- `ignore-feature` opens a heap although the feature query reports no support. gate sees one heap open (1 of 1), and the private buffers are shared.
+
+Run `cmake --build --preset dev --target linear_buffer_backing_check` and `ctest --preset dev --no-tests=error -R '^linear_buffer_backing_' -V`. Set `XBOX2WINDOWS_ADAPTER` to select a hardware adapter and `X2W_TEST_DEBUG_LAYER=1` to enable the debug layer. `linear_buffer_backing_share_hardware` skips (77) on an adapter without existing-heap support; `refusal` covers that case. The controls run on WARP as `WILL_FAIL` tests. Not covered: table SRVs of copied buffers in translated draws still take `frame_copy` at record, and root SRVs still take `upload_from_title` at bind; neither reads the slot 133 backing. Shared buffers and their heaps live for the process, so a private range under one cannot be released, as with the default backing. Unsynchronized concurrent writes, textures, render targets, acceleration structures and command-list slot 148 are outside this slice.
+
 #### Xbox frame events and token wait semantics (#874)
 
 The source-built frame events fixture (`tests/cpu/frame_events_caller.asm`, `tests/cpu/frame_events_provider.cpp`, `tests/cpu/frame_events_check.py`, CTest `cpu_native_frame_events`) models the scheduling and wait semantics of the Xbox frame-pacing extensions in `d3d12_xs.dll`:

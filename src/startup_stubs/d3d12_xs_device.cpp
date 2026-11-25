@@ -39,6 +39,7 @@
 #include "startup_stubs/resource_address_index.h"
 #include "startup_stubs/placed_build.h"
 #include "startup_stubs/placed_buffer_range.h"
+#include "startup_stubs/linear_buffer_backing.h"
 #include "startup_stubs/memory_srv_report.h"
 #include "startup_stubs/memory_srv_census.h"
 #include "startup_stubs/memory_srv_as.h"
@@ -925,6 +926,13 @@ HRESULT __stdcall query_interface(Wrapper* self, const GUID* iid, void** out)
     return hr;
 }
 ULONG __stdcall add_ref(Wrapper* self) { return static_cast<ULONG>(InterlockedIncrement(&self->own().refs)); }
+// X2W_D3D12_LINEAR_BUFFERS (opt-in): the shared or copied backing of slot 133's linear buffers
+// (src/startup_stubs/linear_buffer_backing.h). Unused while the switch is off.
+x2w_startup::LinearBuffers& linear_buffers()
+{
+    static x2w_startup::LinearBuffers buffers;
+    return buffers;
+}
 // The wrappers and their desktop objects stay alive for the process (experiment scope). The one exception is
 // X2W_D3D12_RELEASE_RETIRED=1: the desktop object of a resource of the retire class is freed once nothing refers to it.
 // The wrapper stays.
@@ -954,6 +962,8 @@ ULONG __stdcall release(Wrapper* self)
             drop_mesh_lease_owner(self);
             retire_placement(self);
             if (self->own().retire_when_idle) retire_note_title_release(self);
+            if (x2w_startup::linear_buffer_mode() != x2w_startup::LinearBufferMode::off)
+                linear_buffers().retire(static_cast<ID3D12Resource*>(self->own().real));
         }
         if (self->own().kind == list_kind && self->own().real) {
             discard_mesh_lease_recording(static_cast<ID3D12CommandList*>(self->own().real));
@@ -1548,6 +1558,23 @@ extern "C" __declspec(dllexport) void x2w_d3d12_render_target_stats(unsigned* bi
 {
     if (binds) *binds = static_cast<unsigned>(InterlockedCompareExchange(&render_target_binds, 0, 0));
     if (unresolved) *unresolved = static_cast<unsigned>(InterlockedCompareExchange(&render_target_unresolved, 0, 0));
+}
+
+// Fixtures (X2W_D3D12_LINEAR_BUFFERS): how slot 133 backed a linear buffer (false: the default backing, or
+// not a placed buffer), and the totals since the process started.
+extern "C" __declspec(dllexport) bool x2w_d3d12_linear_buffer_info(void* resource, X2wLinearBufferInfo* info)
+{
+    Wrapper* w = as_wrapper(resource);
+    if (!info || !w || w->own().kind != resource_kind ||
+        x2w_startup::linear_buffer_mode() == x2w_startup::LinearBufferMode::off)
+        return false;
+    return linear_buffers().info(static_cast<ID3D12Resource*>(w->own().real), info);
+}
+extern "C" __declspec(dllexport) void x2w_d3d12_linear_buffer_totals(X2wLinearBufferTotals* totals)
+{
+    if (!totals) return;
+    *totals = X2wLinearBufferTotals{};
+    if (x2w_startup::linear_buffer_mode() != x2w_startup::LinearBufferMode::off) linear_buffers().totals(totals);
 }
 
 // Fixtures: the number of desktop allocators a title allocator stands for (0 if it has none yet).
@@ -3484,6 +3511,19 @@ bool console_layout_srv(const D3D12_RESOURCE_DESC& desc);
 #include "startup_stubs/d3d12_compute_binding_trace.inl"
 #include "startup_stubs/list_copy_texture.inl"
 
+// X2W_D3D12_LINEAR_BUFFERS: the copied linear buffers are refreshed from title memory on the queue
+// just before the title's lists. False: they could not be (logged), and the lists must not run.
+bool linear_refresh(ID3D12CommandQueue* queue, x2w_startup::LinearBuffers::Submission& submission)
+{
+    return x2w_startup::linear_buffer_mode() == x2w_startup::LinearBufferMode::off ||
+           SUCCEEDED(linear_buffers().before_submit(queue, submission));
+}
+void linear_submitted(ID3D12CommandQueue* queue, x2w_startup::LinearBuffers::Submission& submission)
+{
+    if (x2w_startup::linear_buffer_mode() != x2w_startup::LinearBufferMode::off)
+        linear_buffers().after_submit(queue, submission);
+}
+
 // Queue slot 10, desktop ExecuteCommandLists(count, lists).
 void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
 {
@@ -3507,6 +3547,8 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
         auto* queue = static_cast<ID3D12CommandQueue*>(self->own().real);
         bool split = false;
         const auto submit = [&](const auto& native_lists, const auto& wrappers) {
+            x2w_startup::LinearBuffers::Submission linear_submission;
+            if (!linear_refresh(queue, linear_submission)) return;
             const UINT ready_count = static_cast<UINT>(native_lists.size());
             red_producers().execute(queue, native_lists, [&] {
                 if (draw_dump_frame()) {
@@ -3517,6 +3559,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
                 }
             });
             retire_address_uploads(queue, native_lists);
+            linear_submitted(queue, linear_submission);
             retire_draw_sampler_heaps(queue, native_lists);
             note_submits(queue, wrappers);
             retire_note_submission(queue, wrappers);
@@ -3554,7 +3597,11 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
     // No hold or flight is recorded here: the copy handlers that create holds exist only in render mode.
     std::vector<ID3D12CommandList*> real(count);
     for (UINT i = 0; i < count; ++i) real[i] = reinterpret_cast<ID3D12CommandList*>(unwrap(reinterpret_cast<u64>(lists[i])));
-    static_cast<ID3D12CommandQueue*>(self->own().real)->ExecuteCommandLists(count, real.data());
+    auto* queue = static_cast<ID3D12CommandQueue*>(self->own().real);
+    x2w_startup::LinearBuffers::Submission linear;
+    if (!linear_refresh(queue, linear)) return;
+    queue->ExecuteCommandLists(count, real.data());
+    linear_submitted(queue, linear);
     if (first_calls(calls)) log("x2w-d3d12 CommandQueue::ExecuteCommandLists count=%u", count);
 }
 
@@ -4193,6 +4240,39 @@ IndirectAddressAlias indirect_address_alias(Wrapper* device, u64 address, u64 by
 }
 volatile LONG64 placed_buffer_calls, placed_buffer_region_info, placed_buffer_queries;  // five-second totals
 
+// Wraps a placed buffer's desktop resource and publishes it in the placement index. aliased: the
+// resource reads and writes the title memory itself, placed on a heap whose budget is backing_budget
+// (or none); otherwise it is a committed default buffer.
+HRESULT publish_placed_buffer(Wrapper* self, void* address, const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES initial_state,
+                              ID3D12Resource* resource, bool aliased, x2w_budget::Ticket* backing_budget, void** out)
+{
+    Wrapper* w = wrap(resource, resource_kind);
+    w->own().title_memory = address;
+    const ResourceInfo record{*desc, desc->Width, aliased ? Placement::aliased_buffer : Placement::copied_buffer, self, initial_state};
+    auto& group = placement_group(desc->Width);
+    const HRESULT hr = x2w_startup::publish_placement(note_lock, resource_infos, group.by_start, group.max_width,
+        static_cast<const Wrapper*>(w), reinterpret_cast<u64>(address), record, [&] { index_resource(w, record); });
+    if (FAILED(hr)) {
+        // The caller has never received this wrapper; release its desktop resource and storage.
+        AcquireSRWLockExclusive(&registry_lock);
+        registry().erase(w);
+        ReleaseSRWLockExclusive(&registry_lock);
+        if (x2w_startup::linear_buffer_mode() != x2w_startup::LinearBufferMode::off) linear_buffers().discard(resource);
+        resource->Release();
+        _aligned_free(&w->own());
+        return hr;
+    }
+    if (aliased) {
+        w->own().budget = x2w_budget::resource(device_of(self), resource, x2w_budget::placed);
+        w->own().backing_budget = backing_budget;
+        if (backing_budget) backing_budget->begin_use();
+    } else {
+        w->own().budget = x2w_budget::committed(device_of(self), resource, D3D12_HEAP_TYPE_DEFAULT);
+    }
+    *out = w;
+    return S_OK;
+}
+
 HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3D12_RESOURCE_DESC* desc, UINT state,
                                           const void* clear, const GUID* iid, void** out)
 {
@@ -4265,6 +4345,22 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
     if (initial_state != D3D12_RESOURCE_STATE_COMMON && !(desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
         return E_INVALIDARG;
     const UINT64 offset = static_cast<char*>(address) - static_cast<char*>(base);
+    if (x2w_startup::LinearBuffers::eligible(*desc, initial_state)) {
+        // X2W_D3D12_LINEAR_BUFFERS=1 or copy: shared, copied at submit, or refused (linear_buffer_backing.h).
+        const bool uav = (sanitized(*desc).Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0;
+        X2wLinearBufferInfo report{};
+        ID3D12Resource* resource = nullptr;
+        bool shared = false;
+        const HRESULT hr = linear_buffers().place(device_of(self), address, desc->Width, uav, range, &resource, &shared, &report);
+        log("x2w-d3d12 Device::slot133(CreatePlacedResourceX?) linear buffer address=%p base=%p type=0x%lx offset=0x%llx "
+            "width=0x%llx flags=0x%x use=%s existing-heaps=0x%08lx share=0x%08lx -> 0x%08lx %s gpuva=0x%llx", address, base,
+            static_cast<unsigned long>(range.type), offset, desc->Width, desc->Flags, uav ? "gpu-written" : "gpu-read",
+            static_cast<unsigned long>(report.feature_hr), static_cast<unsigned long>(report.share_hr),
+            static_cast<unsigned long>(hr), FAILED(hr) ? "refused" : shared ? "shared" : "copied at submit",
+            resource ? resource->GetGPUVirtualAddress() : 0ull);
+        if (FAILED(hr)) return hr;
+        return publish_placed_buffer(self, address, desc, initial_state, resource, shared, nullptr, out);
+    }
     ID3D12Heap* heap = nullptr;
     x2w_budget::Ticket* backing_budget = nullptr;
     HRESULT hr = S_OK;
@@ -4316,30 +4412,7 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
         "state=0x%x clear=%p riid=%s -> 0x%08lx %s gpuva=0x%llx", address, base, offset, desc->Width, desc->Flags, state,
         clear, text, static_cast<unsigned long>(hr), placement, resource ? resource->GetGPUVirtualAddress() : 0ull);
     if (FAILED(hr)) return hr;
-    Wrapper* w = wrap(resource, resource_kind);
-    w->own().title_memory = address;
-    const ResourceInfo record{*desc, desc->Width, aliased ? Placement::aliased_buffer : Placement::copied_buffer, self, initial_state};
-    auto& group = placement_group(desc->Width);
-    hr = x2w_startup::publish_placement(note_lock, resource_infos, group.by_start, group.max_width,
-        static_cast<const Wrapper*>(w), reinterpret_cast<u64>(address), record, [&] { index_resource(w, record); });
-    if (FAILED(hr)) {
-        // The caller has never received this wrapper; release its desktop resource and storage.
-        AcquireSRWLockExclusive(&registry_lock);
-        registry().erase(w);
-        ReleaseSRWLockExclusive(&registry_lock);
-        resource->Release();
-        _aligned_free(&w->own());
-        return hr;
-    }
-    if (aliased) {
-        w->own().budget = x2w_budget::resource(device_of(self), resource, x2w_budget::placed);
-        w->own().backing_budget = backing_budget;
-        if (backing_budget) backing_budget->begin_use();
-    } else {
-        w->own().budget = x2w_budget::committed(device_of(self), resource, D3D12_HEAP_TYPE_DEFAULT);
-    }
-    *out = w;
-    return S_OK;
+    return publish_placed_buffer(self, address, desc, initial_state, resource, aliased, backing_budget, out);
 }
 
 #include "d3d12_memory_srv.inl"

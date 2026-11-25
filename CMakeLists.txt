@@ -2585,6 +2585,29 @@ foreach(mutant IN ITEMS skip_refresh skip_copy_back reuse_early)
     set_tests_properties(unified_buffer_paths_${mutant}_control PROPERTIES WILL_FAIL TRUE TIMEOUT 90
         SKIP_RETURN_CODE 77)
 endforeach()
+# The production slice (#1914): slot 133's opt-in linear-buffer backing (X2W_D3D12_LINEAR_BUFFERS,
+# src/startup_stubs/linear_buffer_backing.h) through the device and queue wrappers of d3d12_xs.dll, over
+# XMem pages and a private range: the default, real sharing, forced copying, host sharing refusal and
+# a copy without a submit fence. Each mutant removes one guarantee in the DLL and must fail its case.
+add_executable(linear_buffer_backing_check tests/linear_buffer_backing_check.cpp)
+target_include_directories(linear_buffer_backing_check PRIVATE tests)
+target_compile_features(linear_buffer_backing_check PRIVATE cxx_std_17)
+target_link_libraries(linear_buffer_backing_check PRIVATE xmem_shim d3d12_xs_shim d3d12 dxgi d3dcompiler)
+foreach(adapter IN ITEMS warp hardware)
+    foreach(path IN ITEMS default share copy refusal untracked)
+        add_test(NAME linear_buffer_backing_${path}_${adapter} COMMAND linear_buffer_backing_check ${adapter} ${path})
+        set_tests_properties(linear_buffer_backing_${path}_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endforeach()
+endforeach()
+foreach(control IN ITEMS copy:skip_refresh copy:reuse_early copy:copy_gpu_writes refusal:ignore_feature)
+    string(REPLACE ":" ";" parts "${control}")
+    list(GET parts 0 path)
+    list(GET parts 1 mutant)
+    string(REPLACE "_" "-" flag "${mutant}")
+    add_test(NAME linear_buffer_backing_${mutant}_control COMMAND linear_buffer_backing_check warp ${path} --mutate ${flag})
+    set_tests_properties(linear_buffer_backing_${mutant}_control PROPERTIES WILL_FAIL TRUE TIMEOUT 120
+        SKIP_RETURN_CODE 77)
+endforeach()
 # The configured range's windows and GPU addresses (src/d3d12_xs_range.h) with a fake device and fake
 # windows. The mutated run is the negative control.
 add_executable(d3d12_xs_range_check tests/d3d12_xs_range_check.cpp src/d3d12_xs_range.cpp)

@@ -1332,6 +1332,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_D3D12_PERMISSIVE=1` | wraps the device: recording command lists, console present, view tracking; on a runtime without shader model 6.6 (in-box Windows 10), root signatures with the heap-indexing flags (`0xC00`) are serialized again without them, and the copy kept for shader translation gets that call's bits back when `CreateRootSignature` receives the returned blob's own buffer (a copy of the bytes keeps the desktop flags; `d3d12_xs_shim_heap_indexing`). The retry runs only on runtimes that refuse the flags (before shader model 6.6); where the runtime accepts them, `d3d12_xs_shim_heap_indexing` reports a capability skip (77) |
 | `X2W_D3D12_RENDER=1` | draws through translated pipelines from `X2W_SHADER_CACHE` and forwards [single-record indirect Dispatch](experiments.md#gpu-written-indirect-dispatch-arguments), [DrawIndexed](experiments.md#gpu-written-indirect-indexed-draw-arguments), [Draw](experiments.md#gpu-written-indirect-draw-arguments), and [DispatchMesh](experiments.md#gpu-written-indirect-mesh-dispatch-arguments) for supported desktop pipelines and tracked placed buffers |
 | `X2W_SHADER_CACHE=<dir>` | translation cache: the runtime writes source requests `req_<key>.{a,b,root}`, when needed RTV variants `req_<key>.rtv`, and for device slot 67 compute pipelines `req_<key>.{desc,sa,sb,data,root,c67}` (see [Compute pipeline requests](#compute-pipeline-requests)). A console pipeline that an `ExecuteIndirect` draw (list slot 61) refuses writes the same request as a direct draw, once per pipeline, and draws nothing (`startup_indirect_requests_warp`). Only direct draws poll for its manifest, so such a pipeline stays in the `missing` count until a direct draw uses it; the `x2w-render totals` line counts `pipelines first looked up by ExecuteIndirect N`. This is a per-process lookup count. Check for the ready marker `req_<key>.a` to confirm a complete request is available. Run `tools/startup/gfx2hlsl.py --pending <dir>` while the process is running, or start the run with `run.ps1 -Translate` (see [Translating shaders during a run](#translating-shaders-during-a-run)). Active draws poll for an absent manifest at most once per second per pipeline and use the published translation on a subsequent draw. The translator compiles `.vs.cso` and `.ps.cso` with `fxc.exe`: `X2W_FXC`, else the Windows SDK 10.0.26100.0 copy, else the newest `Windows Kits\10\bin\<version>\x64`, else `PATH`. When none exists it writes `<key>.fail` naming `X2W_FXC` without publishing a new manifest. `X2W_FXC=` (empty) publishes the manifest alone. Rerun `--pending` with compilation enabled to fill in missing bytecode for an existing manifest. |
+| `X2W_D3D12_LINEAR_BUFFERS=1` or `=copy` | opt-in backing for linear buffers placed at a title address (device slot 133, initial state `COMMON`): shared where the adapter, extent and memory allow it, otherwise copied from title memory at each submission, otherwise refused with a defined HRESULT; `copy` never shares. Unset or `0`, slot 133 keeps its default backing. See [Linear buffer backing (device slot 133, opt-in)](#linear-buffer-backing-device-slot-133-opt-in) |
 | `X2W_D3D12_QUERY_SLOTS=1` | diagnostic, in render mode: binds command-list slots 28 to 30 to the hypothesised occlusion query methods (see [Occlusion queries](#occlusion-queries)). Unset, the three slots stay no-ops |
 | `X2W_D3D12_BUDGET=1` | adds [video memory budget and allocation counts](#d3d12-resource-budget) to the D3D12 heartbeat |
 | `X2W_D3D12_RELEASE_RETIRED=1` | opt-in, effective with `X2W_D3D12_RENDER=1` only (the list handlers that record holds exist only there): frees the desktop object of a released committed 2D texture of one narrow class once no recorded list, submission or release-time fence refers to it ([details](#d3d12-resource-budget)). Unset, nothing changes |
@@ -2902,6 +2903,32 @@ layouts"):
 
 - `ctest --preset release --no-tests=error -R '^startup_gfx10_layout' -V`
 - `ctest --preset release --no-tests=error -j 1 -R '^startup_address_console_' -V`
+
+## Linear buffer backing (device slot 133, opt-in)
+
+By default slot 133 aliases a buffer only in private memory, through an existing heap cached by
+allocation base and opened without a `D3D12_FEATURE_EXISTING_HEAPS` query. Anything else gets a
+committed default buffer that does not alias the title memory, holds zeros and is reported as
+success (`not aliased` in the log). `X2W_D3D12_LINEAR_BUFFERS` changes this for one buffer kind: a
+buffer description with row-major or unknown layout and initial state `COMMON`
+(`src/startup_stubs/linear_buffer_backing.h`, [#1914](https://github.com/R0Y00/Xbox2Windows/issues/1914)).
+Buffers in `UNORDERED_ACCESS` or acceleration-structure state, and textures, keep the default backing.
+
+| Value | Backing |
+|---|---|
+| unset or `0` | the default above; none of the linear-buffer code runs |
+| `1` | shared when the adapter reports `D3D12_FEATURE_EXISTING_HEAPS` (queried once, before any open) and the buffer lies in one committed private allocation at a 64 KiB-aligned offset; otherwise copied; otherwise refused |
+| `copy` | copied; otherwise refused |
+
+- Shared: a cross-adapter buffer placed on the private allocation's heap, cached by base. The GPU reads and writes title memory; nothing is copied.
+- An XMem view is never shared. A heap opened from a view keeps it mapped, and XMem's unmap of those pages then fails with error 87. Sharing reports `HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)` (`0x80070032`) and the buffer is copied. A buffer across several allocations, or at an unaligned offset, reports `E_INVALIDARG`. Both are decided before any D3D12 call.
+- Copied: a committed default buffer that the command-queue wrapper refreshes from title memory just before the title's lists run on that queue, not at bind or record. Only bytes that changed since the last upload are copied, through an upload staging buffer. A staging buffer is reused only after the queue fence of the submission that read it has completed.
+- Refused, and no resource is created: a GPU-written use (`ALLOW_UNORDERED_ACCESS`) that cannot be shared returns the sharing HRESULT, or `DXGI_ERROR_UNSUPPORTED` when sharing was not attempted. The copy has no point at which GPU writes reach title memory. Without a submit fence (`X2W_TEST_SUBMIT_FENCE_FAIL=1`), slot 133 returns `E_NOT_VALID_STATE` (`0x8007139f`).
+- A submission whose refresh cannot be staged is not executed. This happens when the staging pool stays full of in-flight buffers past a 5 s wait (`DXGI_ERROR_WAS_STILL_DRAWING`) or when staging cannot be created. The HRESULT is logged (`x2w-d3d12 linear buffers: submission refused`).
+
+Each placement logs `x2w-d3d12 Device::slot133(CreatePlacedResourceX?) linear buffer ... existing-heaps=<hr> share=<hr> -> <hr> shared|copied at submit|refused`. Fixtures read the same facts through `x2w_d3d12_linear_buffer_info` and `x2w_d3d12_linear_buffer_totals` (`src/startup_stubs/linear_buffer_report.h`). Fixture-only switches: `X2W_TEST_EXISTING_HEAPS_UNSUPPORTED=1` makes the feature query report no support, as an adapter with `EXISTING_HEAPS = 0` does. `X2W_TEST_LINEAR_BUFFER_MUTANT=<name>` removes one guarantee for a negative control. Results and commands: [Production slice: slot 133 linear buffers](experiments.md#production-slice-slot-133-linear-buffers-1914).
+
+Not covered: table SRVs of copied buffers in translated draws still take `frame_copy` at record, and root SRVs (`list_root_srv`) still take `upload_from_title` at bind. Neither reads the slot 133 backing. Shared buffers and their heaps live for the process, like every wrapper, so a private range under one cannot be released.
 
 ## Buffer memory SRVs (device slot 70)
 
