@@ -68,6 +68,10 @@
 //   - no internal refresh queue or fence (X2W_TEST_SUBMIT_FENCE_FAIL=1 gives E_NOT_VALID_STATE, else
 //     the HRESULT of creating them): consumers could not be ordered behind refreshes.
 //   - the copy's default buffer cannot be created: that HRESULT.
+//   - the XMem lease path is on (X2W_MESH86_XMEM_SRV or X2W_MESH_INDIRECT_XMEM) and the placement is one
+//     it takes: XMem pages (MEM_MAPPED) with console flags 0, kept as the default copied placement that
+//     the lease path mirrors and publishes. HRESULT_FROM_WIN32(ERROR_BUSY): deferred to that owner, so
+//     the two never back one placement.
 //
 // At submit nothing is refused: holding back a submission can leave a title waiting on its fences.
 // When a copied buffer's refresh cannot be staged (a staging buffer or refresh list cannot be
@@ -193,6 +197,20 @@ public:
         return linear_buffer_mode() != LinearBufferMode::off && desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
                (desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR || desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN) &&
                desc.Width && initial_state == D3D12_RESOURCE_STATE_COMMON;
+    }
+
+    // The refusal recorded for a placement that another owner takes: the XMem lease path, which takes
+    // the default (copied) placements of XMem pages whose console flags are 0 while it is on.
+    static constexpr HRESULT lease_deferral = HRESULT_FROM_WIN32(ERROR_BUSY);
+    static HRESULT defer(bool uav, X2wLinearBufferInfo* report)
+    {
+        *report = X2wLinearBufferInfo{};
+        report->use = uav ? gpu_written : gpu_read;
+        report->feature_hr = S_FALSE;
+        report->share_hr = S_FALSE;
+        report->path = kept_default_path;
+        report->refusal_hr = lease_deferral;
+        return lease_deferral;
     }
 
     // False under the refusal-silent mutant: a kept default backing is then not reported anywhere.

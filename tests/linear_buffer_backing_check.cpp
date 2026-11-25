@@ -19,6 +19,8 @@
 //              5, 8 ... fail, so one refresh per pool cannot be staged
 //   contention X2W_D3D12_LINEAR_BUFFERS=copy with X2W_TEST_LINEAR_STAGING_LIMIT=1: one staging buffer,
 //              so a refresh waits for the fence of the submission that holds it
+//   lease      X2W_D3D12_LINEAR_BUFFERS=copy with X2W_MESH86_XMEM_SRV=1: the mesh XMem lease path is on and
+//              owns XMem placements with console flags 0; the linear backing must defer to it there
 //
 // Where the new path cannot keep its guarantees (a GPU-written use that is not shared, no submit
 // fence), slot 133 must keep the default backing and return what it returns with the switch off:
@@ -74,6 +76,8 @@
 //        waiting refresh has taken that buffer again (none is created), and both gated reads see C.
 //   budget (share, copy) with X2W_D3D12_BUDGET=1: a shared buffer counts as placed memory (its heap
 //        live), a copied one as a committed buffer; live while held, retained after the title's release.
+//   lease (lease only) an XMem buffer keeps the default backing with HRESULT_FROM_WIN32(ERROR_BUSY)
+//        reported (old behaviour: reads zero); a private one is copied and reads B.
 //   pin  (share, XMem; measured, not asserted) a heap opened from an XMem view and a buffer placed on
 //        it, then XMem's unmap of those pages, while they live and after their release.
 //
@@ -262,7 +266,7 @@ std::string pointer_text(const void* p)
     return text;
 }
 
-enum class Path { default_backing, share, copy, refusal, untracked, stale, contention };
+enum class Path { default_backing, share, copy, refusal, untracked, stale, contention, lease };
 const char* path_name(Path p)
 {
     switch (p) {
@@ -272,7 +276,8 @@ const char* path_name(Path p)
     case Path::refusal: return "refusal";
     case Path::untracked: return "untracked";
     case Path::stale: return "stale";
-    default: return "contention";
+    case Path::contention: return "contention";
+    default: return "lease";
     }
 }
 
@@ -1056,6 +1061,32 @@ struct Run {
     }
 
     // xq: queue 1 waits on a title fence that queue 2 signals after its list.
+    // lease: with the mesh XMem lease path on, an XMem placement with console flags 0 is the lease path's:
+    // slot 133 keeps the default backing (not aliased) and records the deferral; a private one is copied.
+    void case_lease(Pool& pool)
+    {
+        Memory memory;
+        if (!pool.allocate(memory, A)) return row(pool, "lease", false, "allocation failed");
+        Placed p = place(gpu, memory.buffer(), false);
+        TitleList list;
+        if (FAILED(p.hr) || !p.backing || !list.begin(gpu)) return row(pool, "lease", false, "slot 133 -> " + hex(p.hr));
+        list.read(p.backing.Get());
+        list.close();
+        write(memory.buffer(), r0, B, words);
+        if (!gpu.wait(list.submit())) return row(pool, "lease", false, "fence timeout");
+        const Tally t = tally(gpu.read_output().data(), r0 / 4, key);
+        refresh_info(p);
+        std::string text = "slot 133 -> " + hex(p.hr) + ", " + backing_text(p) + "; GPU read " + t.text();
+        bool pass;
+        if (pool.xmem) {
+            pass = kept_ok(p, HRESULT_FROM_WIN32(ERROR_BUSY), text) && t.zero == words;
+            text += " (deferred to the XMem lease path; old behaviour: not aliased)";
+        } else {
+            pass = p.linear && p.info.path == 2 && t.count[B] == words;
+        }
+        row(pool, "lease", pass, text);
+    }
+
     // budget (share, copy): X2W_D3D12_BUDGET counts a shared buffer as placed memory on its heap and a
     // copied one as a committed buffer, live while the title holds it and retained after its release.
     void case_budget(Pool& pool)
@@ -1259,6 +1290,7 @@ int main(int argc, char** argv)
     else if (p == "untracked") path = Path::untracked;
     else if (p == "stale") path = Path::stale;
     else if (p == "contention") path = Path::contention;
+    else if (p == "lease") path = Path::lease;
     else return 2;
     std::string mutant;
     if (argc == 5 && std::strcmp(argv[3], "--mutate") == 0) mutant = argv[4];
@@ -1271,11 +1303,13 @@ int main(int argc, char** argv)
     SetEnvironmentVariableW(L"X2W_D3D12_RENDER", L"1");
     SetEnvironmentVariableW(L"X2W_XMEM_SHARED_VIEWS", L"1");
     SetEnvironmentVariableW(L"X2W_D3D12_LINEAR_BUFFERS", path == Path::default_backing ? nullptr
-                                                         : path == Path::copy || path == Path::untracked || path == Path::stale || path == Path::contention ? L"copy" : L"1");
+                                                         : path == Path::copy || path == Path::untracked || path == Path::stale || path == Path::contention ||
+                                                                 path == Path::lease ? L"copy" : L"1");
     SetEnvironmentVariableW(L"X2W_TEST_EXISTING_HEAPS_UNSUPPORTED", path == Path::refusal ? L"1" : nullptr);
     SetEnvironmentVariableW(L"X2W_TEST_SUBMIT_FENCE_FAIL", path == Path::untracked ? L"1" : nullptr);
     SetEnvironmentVariableW(L"X2W_TEST_LINEAR_REFRESH_FAIL", path == Path::stale ? L"3" : nullptr);
     SetEnvironmentVariableW(L"X2W_TEST_LINEAR_STAGING_LIMIT", path == Path::contention ? L"1" : nullptr);
+    SetEnvironmentVariableW(L"X2W_MESH86_XMEM_SRV", path == Path::lease ? L"1" : nullptr);
     SetEnvironmentVariableA("X2W_TEST_LINEAR_BUFFER_MUTANT", mutant.empty() ? nullptr : mutant.c_str());
     {
         // The DLL's log lines go to linear_buffer_backing_<path>_<adapter>[_<mutant>].log next to this executable.
@@ -1353,6 +1387,10 @@ int main(int argc, char** argv)
         }
         if (path == Path::contention) {
             run.case_contention(pool);
+            continue;
+        }
+        if (path == Path::lease) {
+            run.case_lease(pool);
             continue;
         }
         run.case_a(pool);

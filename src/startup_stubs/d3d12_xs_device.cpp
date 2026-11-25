@@ -4355,8 +4355,12 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
         ID3D12Resource* resource = nullptr;
         bool shared = false;
         x2w_budget::Ticket* linear_heap_budget = nullptr;
-        const HRESULT placed = linear_buffers().place(device_of(self), address, desc->Width, uav, range, &resource, &shared,
-                                                      &linear_heap_budget, &linear);
+        // The mesh XMem lease path takes the default (copied) placements of XMem pages whose console flags
+        // are 0 (note_mesh_xmem_write); while it is on, the linear backing defers to it there.
+        const bool lease_owns = mesh_xmem_tracking() && range.type == MEM_MAPPED && desc->Flags == D3D12_RESOURCE_FLAG_NONE;
+        const HRESULT placed = lease_owns ? x2w_startup::LinearBuffers::defer(uav, &linear)
+                                          : linear_buffers().place(device_of(self), address, desc->Width, uav, range, &resource,
+                                                                   &shared, &linear_heap_budget, &linear);
         if (SUCCEEDED(placed)) {
             log("x2w-d3d12 Device::slot133(CreatePlacedResourceX?) linear buffer address=%p base=%p type=0x%lx offset=0x%llx "
                 "width=0x%llx flags=0x%x use=%s existing-heaps=0x%08lx share=0x%08lx -> 0x%08lx %s gpuva=0x%llx", address, base,
