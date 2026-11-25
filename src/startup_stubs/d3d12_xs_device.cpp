@@ -4354,14 +4354,18 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
         const bool uav = (sanitized(*desc).Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0;
         ID3D12Resource* resource = nullptr;
         bool shared = false;
-        const HRESULT placed = linear_buffers().place(device_of(self), address, desc->Width, uav, range, &resource, &shared, &linear);
+        x2w_budget::Ticket* linear_heap_budget = nullptr;
+        const HRESULT placed = linear_buffers().place(device_of(self), address, desc->Width, uav, range, &resource, &shared,
+                                                      &linear_heap_budget, &linear);
         if (SUCCEEDED(placed)) {
             log("x2w-d3d12 Device::slot133(CreatePlacedResourceX?) linear buffer address=%p base=%p type=0x%lx offset=0x%llx "
                 "width=0x%llx flags=0x%x use=%s existing-heaps=0x%08lx share=0x%08lx -> 0x%08lx %s gpuva=0x%llx", address, base,
                 static_cast<unsigned long>(range.type), offset, desc->Width, desc->Flags, uav ? "gpu-written" : "gpu-read",
                 static_cast<unsigned long>(linear.feature_hr), static_cast<unsigned long>(linear.share_hr),
                 static_cast<unsigned long>(placed), shared ? "shared" : "copied at submit", resource->GetGPUVirtualAddress());
-            return publish_placed_buffer(self, address, desc, initial_state, resource, shared, nullptr, out);
+            // Budgets as for the default backing: a shared buffer is a placed resource on its heap, a copied
+            // one a committed default buffer (its staging is counted as upload memory when it is created).
+            return publish_placed_buffer(self, address, desc, initial_state, resource, shared, linear_heap_budget, out);
         }
         if (x2w_startup::LinearBuffers::report_refusals())
             std::snprintf(linear_note, sizeof(linear_note),

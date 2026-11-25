@@ -107,6 +107,7 @@
 #include "startup_stubs/linear_buffer_report.h"
 #include "startup_stubs/local_log.h"
 #include "startup_stubs/placed_buffer_range.h"
+#include "startup_stubs/resource_budget.h"
 
 namespace x2w_startup {
 
@@ -199,13 +200,15 @@ public:
 
     // Slot 133 for an eligible buffer. range is measure_placed_buffer's answer for (address, width) and
     // uav says whether the desktop flags keep ALLOW_UNORDERED_ACCESS. On success *out holds the
-    // desktop resource and *shared whether it aliases the title memory. A failure is a refusal: the
-    // caller keeps the default backing and passes *report (path kept_default_path) to kept_default().
+    // desktop resource and *shared whether it aliases the title memory; a shared one's heap budget
+    // (X2W_D3D12_BUDGET, or null) is in *backing_budget. A failure is a refusal: the caller keeps the
+    // default backing and passes *report (path kept_default_path) to kept_default().
     HRESULT place(ID3D12Device* device, void* address, UINT64 width, bool uav, const PlacedBufferRange& range,
-                  ID3D12Resource** out, bool* shared, X2wLinearBufferInfo* report)
+                  ID3D12Resource** out, bool* shared, x2w_budget::Ticket** backing_budget, X2wLinearBufferInfo* report)
     {
         *out = nullptr;
         *shared = false;
+        *backing_budget = nullptr;
         std::lock_guard lock(mutex_);
         ++totals_.placements;
         Record record{};
@@ -226,7 +229,8 @@ public:
             else if (range.type != MEM_PRIVATE)
                 record.info.share_hr = E_INVALIDARG;
             else
-                record.info.share_hr = share(device, range, offset, width, uav, &resource, &record.info.heap_generation);
+                record.info.share_hr = share(device, range, offset, width, uav, &resource, &record.info.heap_generation,
+                                             backing_budget);
         }
         HRESULT hr = S_OK;
         if (SUCCEEDED(record.info.share_hr) && record.info.share_hr != S_FALSE) {
@@ -277,6 +281,7 @@ public:
         }
         if (FAILED(hr)) {
             if (resource) resource->Release();
+            *backing_budget = nullptr;
             record.info.path = kept_default_path;
             record.info.refusal_hr = hr;
             record.info.backing = nullptr;
@@ -469,6 +474,7 @@ private:
         void* base;
         ID3D12Heap* heap;
         UINT64 generation, bytes;
+        x2w_budget::Ticket* budget;  // the heap's budget ticket (X2W_D3D12_BUDGET), counted while a buffer uses it
     };
     // 256 staging buffers; X2W_TEST_LINEAR_STAGING_LIMIT=<n> (fixtures) lowers it, to make the pool fill.
     static std::size_t staging_limit()
@@ -504,7 +510,7 @@ private:
     // A private range only (place() decides the rest). Its heap is opened once per allocation base and
     // cached: the open heap keeps the range from being released, so the base cannot name other memory.
     HRESULT share(ID3D12Device* device, const PlacedBufferRange& range, UINT64 offset, UINT64 width, bool uav,
-                  ID3D12Resource** out, UINT64* generation)
+                  ID3D12Resource** out, UINT64* generation, x2w_budget::Ticket** budget)
     {
         const Heap* entry = nullptr;
         for (const Heap& known : heaps_)
@@ -523,7 +529,7 @@ private:
             }
             if (FAILED(hr)) return hr;
             try {
-                heaps_.push_back({range.base, heap, ++generation_, heap->GetDesc().SizeInBytes});
+                heaps_.push_back({range.base, heap, ++generation_, heap->GetDesc().SizeInBytes, x2w_budget::backing_heap(heap, 0)});
             } catch (const std::bad_alloc&) {
                 heap->Release();
                 return E_OUTOFMEMORY;
@@ -531,6 +537,7 @@ private:
             entry = &heaps_.back();
         }
         *generation = entry->generation;
+        *budget = entry->budget;
         if (entry->bytes < offset || width > entry->bytes - offset) return E_INVALIDARG;
         const auto desc = linear_detail::buffer(width, static_cast<D3D12_RESOURCE_FLAGS>(
             (uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE) | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER));
@@ -716,6 +723,8 @@ private:
         HRESULT hr = internal_device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ,
                                                                nullptr, IID_PPV_ARGS(&staging->buffer));
         staging->bytes = size;
+        // The pool's staging buffers live for the process: counted as upload memory (X2W_D3D12_BUDGET).
+        if (SUCCEEDED(hr)) x2w_budget::committed(internal_device_, staging->buffer, D3D12_HEAP_TYPE_UPLOAD);
         void* mapped = nullptr;
         const D3D12_RANGE none{0, 0};
         if (SUCCEEDED(hr)) hr = staging->buffer->Map(0, &none, &mapped);

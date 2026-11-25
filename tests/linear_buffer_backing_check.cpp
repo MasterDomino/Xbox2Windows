@@ -72,6 +72,8 @@
 //        waits for the only staging buffer, whose copy the fixture holds on the internal refresh
 //        queue: all three must finish while the wait is still under way. After the refreshes land the
 //        waiting refresh has taken that buffer again (none is created), and both gated reads see C.
+//   budget (share, copy) with X2W_D3D12_BUDGET=1: a shared buffer counts as placed memory (its heap
+//        live), a copied one as a committed buffer; live while held, retained after the title's release.
 //   pin  (share, XMem; measured, not asserted) a heap opened from an XMem view and a buffer placed on
 //        it, then XMem's unmap of those pages, while they live and after their release.
 //
@@ -110,11 +112,13 @@
 
 #include "xmem_test_device.h"
 #include "../src/startup_stubs/linear_buffer_report.h"
+#include "../src/startup_stubs/resource_budget.h"
 
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
 extern "C" __declspec(dllimport) bool x2w_d3d12_linear_buffer_info(void*, X2wLinearBufferInfo*);
 extern "C" __declspec(dllimport) void x2w_d3d12_linear_buffer_totals(X2wLinearBufferTotals*);
 extern "C" __declspec(dllimport) bool x2w_d3d12_linear_buffer_internal_queue(void**);
+extern "C" __declspec(dllimport) BOOL x2w_d3d12_budget_snapshot(x2w_budget::Snapshot*, SIZE_T);
 extern "C" __declspec(dllimport) void* WINAPI XMemVirtualAlloc(void*, SIZE_T, DWORD, ULONGLONG, DWORD);
 extern "C" __declspec(dllimport) BOOL WINAPI XMemAllocatePhysicalPages(ULONG_PTR, PULONG_PTR, PULONG_PTR);
 extern "C" __declspec(dllimport) BOOL WINAPI XMemFreePhysicalPages(ULONG_PTR, PULONG_PTR);
@@ -1052,6 +1056,37 @@ struct Run {
     }
 
     // xq: queue 1 waits on a title fence that queue 2 signals after its list.
+    // budget (share, copy): X2W_D3D12_BUDGET counts a shared buffer as placed memory on its heap and a
+    // copied one as a committed buffer, live while the title holds it and retained after its release.
+    void case_budget(Pool& pool)
+    {
+        Memory memory;
+        x2w_budget::Snapshot before{}, held{}, released{};
+        if (!pool.allocate(memory, A) || !x2w_d3d12_budget_snapshot(&before, sizeof(before)))
+            return row(pool, "budget", false, "setup failed or X2W_D3D12_BUDGET not on");
+        Placed p = place(gpu, memory.buffer(), false);
+        TitleList list;
+        if (FAILED(p.hr) || !p.backing || !list.begin(gpu)) return row(pool, "budget", false, "slot 133 -> " + hex(p.hr));
+        list.read(p.backing.Get());
+        list.close();
+        if (!gpu.wait(list.submit())) return row(pool, "budget", false, "fence timeout");
+        x2w_d3d12_budget_snapshot(&held, sizeof(held));
+        const bool shared = p.linear && p.info.path == 1;
+        const int category = shared ? x2w_budget::placed : x2w_budget::buffer;
+        p.wrapper.Reset();  // the title's release
+        x2w_d3d12_budget_snapshot(&released, sizeof(released));
+        const auto live = [&](const x2w_budget::Snapshot& snap) { return snap.live[category].objects; };
+        const auto kept = [&](const x2w_budget::Snapshot& snap) { return snap.retained[category].objects; };
+        const bool heap_live = !shared || held.live[x2w_budget::heap].objects >= 1;
+        const bool pass = p.linear && live(held) == live(before) + 1 && live(released) == live(before) &&
+                          kept(released) == kept(before) + 1 && heap_live && released.unmeasured == before.unmeasured;
+        row(pool, "budget", pass,
+            std::string(shared ? "shared: placed" : "copied: buffer") + " objects live " + std::to_string(live(before)) + " -> " +
+                std::to_string(live(held)) + " -> " + std::to_string(live(released)) + " after release, retained +" +
+                std::to_string(kept(released) - kept(before)) + (shared ? ", heap live " + std::to_string(held.live[x2w_budget::heap].objects) : "") +
+                ", unmeasured +" + std::to_string(released.unmeasured - before.unmeasured));
+    }
+
     void case_xq(Pool& pool)
     {
         Lane q2;
@@ -1231,6 +1266,7 @@ int main(int argc, char** argv)
 
     // The switches are read once, by the first call that needs them: set them before any.
     SetEnvironmentVariableW(L"X2W_D3D12_PERMISSIVE", L"1");
+    SetEnvironmentVariableW(L"X2W_D3D12_BUDGET", L"1");  // budget accounting (case budget); changes no backing
     SetEnvironmentVariableW(L"X2W_D3D12_LIST_NOOP", L"1");
     SetEnvironmentVariableW(L"X2W_D3D12_RENDER", L"1");
     SetEnvironmentVariableW(L"X2W_XMEM_SHARED_VIEWS", L"1");
@@ -1330,8 +1366,10 @@ int main(int argc, char** argv)
             run.case_gate2q(pool, false);
             run.case_gate2q(pool, true);
             run.case_xq(pool);
+            run.case_budget(pool);
         }
         run.probe_view_pin(pool);
+        if (path == Path::share) run.case_budget(pool);
     }
     const X2wLinearBufferTotals t = totals();
     std::printf("totals: placements %llu (shared %llu, copied %llu, kept default %llu), feature queries %llu, heap opens %llu "
