@@ -45,8 +45,7 @@
 //
 // Finally the desktop device must not be removed and, with the debug layer, must hold no errors.
 //
-// Exit codes: 0 pass; 77 no physical adapter; 10 slot 148 not implemented (it returned null for the
-// traced request on an open list); 11 slot 148 returned memory but its module has no GPU address
+// Exit codes: 0 pass; 77 no physical adapter; 11 slot 148 returned memory but its module has no GPU address
 // export; 12 traced request: CPU range, alignment or GPU address; 13 an allocation after a successful
 // Close was not refused; 14 invalid arguments not refused or alignment not honoured; 15 payload
 // mismatch; 16 overwrite control did not read B; 17 reuse control: B reuses A's range but A's read
@@ -90,7 +89,7 @@ constexpr char kGpuExport[] = "x2w_d3d12_upload_gpu_address";
 using GpuAddress = unsigned long long (*)(void* list, const void* cpu, unsigned long long bytes);
 
 enum Exit {
-    pass = 0, usage = 2, no_adapter = 3, no_device = 4, setup = 5, not_implemented = 10, no_gpu_export = 11,
+    pass = 0, usage = 2, no_adapter = 3, no_device = 4, setup = 5, no_gpu_export = 11,
     traced_shape = 12, close_refusal = 13, invalid_arguments = 14, payload = 15, overwrite_control = 16,
     reuse_control = 17, ordering = 18, device_state = 19, held_reuse = 20, skip = 77
 };
@@ -180,7 +179,7 @@ struct Client {
         if (!cpu) {
             std::printf("%s: CommandList::slot148(0x%llx, 0x%llx) returned 0x0 on an open list\n", label,
                         static_cast<unsigned long long>(kBytes), static_cast<unsigned long long>(kAlignment));
-            return not_implemented;
+            return traced_shape;
         }
         if (!gpu_address) {
             HMODULE owner = nullptr;
@@ -359,10 +358,7 @@ int held_sequence(Client& c, Mode mode)
     if (mode == Mode::allocator && !ok(invoke(a, kAllocatorReset))) return setup;
     if (!ok(invoke(list, kResetSlot, arg(mode == Mode::allocator ? a : b)))) return setup;
     Upload second;
-    if (const int result = c.traced(list, label, second)) {
-        if (result == not_implemented) std::printf("%s: slot 148 refused after a Reset with a valid allocator\n", label);
-        return result == not_implemented ? traced_shape : result;
-    }
+    if (const int result = c.traced(list, label, second)) return result;
     if (overlaps(first.cpu, second.cpu, kBytes) || overlaps(first.gpu, second.gpu, kBytes)) {
         std::printf("%s: B (cpu 0x%llx, gpu 0x%llx) reuses A's range (cpu 0x%llx, gpu 0x%llx) while A is held\n", label,
                     static_cast<unsigned long long>(second.cpu), static_cast<unsigned long long>(second.gpu),
@@ -400,11 +396,11 @@ int forced_reuse(Client& c)
     void* list = a ? c.list(a) : nullptr;
     if (!list || !ok(invoke(list, kResetSlot, arg(a)))) return setup;
     Upload first, second;
-    if (const int result = c.traced(list, "reuse", first)) return result == not_implemented ? traced_shape : result;
+    if (const int result = c.traced(list, "reuse", first)) return result;
     if (!fill(first.cpu, kPayloadA, kBytes)) return traced_shape;
     if (const int result = c.close(list, "reuse")) return result;
     if (!ok(invoke(list, kResetSlot, arg(a)))) return setup;
-    if (const int result = c.traced(list, "reuse", second)) return result == not_implemented ? traced_shape : result;
+    if (const int result = c.traced(list, "reuse", second)) return result;
     if (!fill(second.cpu, kPayloadB, kBytes)) return traced_shape;
     if (!overlaps(first.gpu, second.gpu, kBytes)) {
         std::printf("reuse: not exercised, B (gpu 0x%llx) does not overlap the unsubmitted A (gpu 0x%llx)\n",
@@ -488,11 +484,6 @@ int main(int argc, char** argv)
         return setup;
 
     int result = held_sequence(c, Mode::fresh);
-    if (result == not_implemented) {
-        std::printf("slot 148 not implemented: the traced request (0x%llx bytes, 0x%llx alignment) returned no memory\n",
-                    static_cast<unsigned long long>(kBytes), static_cast<unsigned long long>(kAlignment));
-        return result;
-    }
     if (!result) result = held_sequence(c, Mode::allocator);
     if (!result) result = held_sequence(c, Mode::overwrite);
     if (!result) result = forced_reuse(c);

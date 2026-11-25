@@ -481,6 +481,20 @@ cmake --build --preset dev --target cpu_crc_line cpu_crc_castagnoli cpu_exe_orig
 ctest --preset dev --no-tests=error -R '^cpu_exe_aot_convert$' -V
 ```
 
+## Bounded startup debugger logging
+
+The source-built `startup_debug_probe` calls a known entry point 19 times.
+`X2W_LOG_AT` records the first two calls with a changing register, two known
+qwords at signed offsets and an unreadable address. The probe checks that all
+19 calls execute and the original opcode is restored. A second run uses the
+default limit and register list, with `X2W_COUNT` sharing the site and
+counting all 19 calls. See the [startup debugger switches](startup-runtime.md).
+
+```powershell
+cmake --build --preset dev --target startup_debug_probe
+ctest --preset dev --no-tests=error -R '^startup_debug' -V
+```
+
 ## EXE startup through the desktop runtime shims
 
 The source-built `cpu_shim_startup` EXE calls a companion DLL that links
@@ -11229,14 +11243,24 @@ queue open for the caller to close after delivery.
 completion, expiration or successful queue closure. The work port has no work
 items in this profile. The
 shim keeps its state in a side table keyed by the block address and reads only
-the leading queue, context and callback fields. `XAsyncGetStatus`,
-`XUserAddAsync` and `XPackageMountWithUiAsync` remain `E_NOTIMPL` stubs.
+the leading queue, context and callback fields. `XUserAddAsync` and `XPackageMountWithUiAsync` remain `E_NOTIMPL` stubs.
+`XAsyncGetStatus` and `XAsyncGetResultSize` answer for tracked blocks only.
+Operation completion and callback dispatch stay separate: once the provider work
+has finished, both queries report the stored status (and a result size of one
+provider handle) even while the completion callback still waits for
+`XTaskQueueDispatch`, matching the installed runtime. A block whose work is
+still in flight reports `E_PENDING`; a waiting status sleeps until that work
+completes or the start fails (then `E_INVALIDARG`). A null, untracked or
+already consumed block returns `E_INVALIDARG`. `xgameruntime_async_status` covers
+this against the manual queue of #2179 and the completion-port contract of #2170,
+including Begin, query status and size before the first dispatch, then dispatch
+exactly once.
 `xgameruntime_gamesave_async` covers the positive completion, the callback and
 in-callback claim, the error paths, reuse, provider exhaustion, early result
 retrieval before dispatch, null-queue refusal and the finite dispatch wait.
 
 ```powershell
-cmake --build --preset dev --target xgameruntime_shim xgameruntime_shim_check xgameruntime_contracts_check xgameruntime_pls_xpackage_check xgameruntime_identity_check xgameruntime_gamesave_async_check
+cmake --build --preset dev --target xgameruntime_shim xgameruntime_shim_check xgameruntime_contracts_check xgameruntime_pls_xpackage_check xgameruntime_identity_check xgameruntime_gamesave_async_check xgameruntime_async_status_check
 ctest --preset dev --no-tests=error -R '^xgameruntime_' -V
 python -B tests/xgameruntime_table_check.py
 ```
@@ -12161,6 +12185,64 @@ ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_mad_' -V
 python -B tests/startup_gfx2hlsl_mad_check.py binary llvm-mc-15
 ```
 
+## Compute stage in the startup translator
+
+`gfx2hlsl.ComputePipeline` translates one gfx1013 compute program with the root and resource model of
+the graphics stages. The caller passes `COMPUTE_PGM_RSRC2` and the thread group size, which are pipeline
+register state. Each group-ID axis enabled by `TGID_X/Y/Z_EN` gets the next SGPR after the user
+SGPRs, with no gap for an omitted axis (`SV_GroupID`). v0-v2 hold `SV_GroupThreadID` up to
+`TIDIG_COMP_CNT`. This is how `compute_store_aot` decodes `COMPUTE_PGM_RSRC2` (#1608).
+`TG_SIZE_EN` stays refused.
+
+Root parameters are placed from s4, which is an inference, like the graphics stages' s8. #1608 defines no
+root placement. The only in-repo evidence is the local compute-record scan above, whose table bindings
+used s4 or s5. A numeric read of a user SGPR that the root signature does not place, including s0-s3,
+is refused because its value is unknown.
+
+Inside a block that `s_cbranch_execz` skips, a scalar instruction is refused. The wave runs that block
+when any lane is active, while the one-lane model would skip it for an inactive lane. An image sample
+with implicit LOD is also refused, because a compute lane has no derivatives.
+
+The output is a `cs` HLSL main with `[numthreads]` and a version 2 manifest. The manifest has
+`stage cs` and `group` lines, plus one `uav <slot> table <param> <byte offset>` line for each store
+target. The only store lowered is `buffer_store_dword[x2|x3|x4]` in the `offen` form: a per-lane byte VGPR, plus
+the scalar offset and the immediate, through a descriptor at a fixed root-table offset. It writes a
+`RWByteAddressBuffer`. All four descriptor words must still be the words the `s_load` returned. Refused:
+- the `off` and `idxen` forms, and the cache-policy flags;
+- an immediate offset that is not a multiple of 4;
+- a descriptor word that was moved, overwritten or modified;
+- a descriptor that is also loaded.
+
+As in #2059, the run-time part of the address is rounded down to a multiple of 4. That rounding, and the
+handling of out-of-range stores, are assumptions, not measurements.
+The runtime has no slot-67 path yet, so no translated compute program runs in the stand-in.
+
+`startup_gfx2hlsl_compute_check.py` translates three source-built programs:
+- Case A enables all three group-ID axes and v0-v2, with group size 2x3x4 and 3x2x2 groups, and stores one word.
+- Case B enables X and Z only, so Z is s8, with group size 5x2x1 and 4x1x3 groups. It stores two words at an
+  immediate offset.
+- Case C enables Y only, with group size 8x1x1 and 1x5x1 groups. It stores four words from every lane, then
+  three words under an exec mask set from a compare.
+
+Each thread reads a read buffer at its own index and stores to its own destination. DXC compiles the HLSL
+for `cs_6_0`, and a plain D3D12 device dispatches it. The root signature is the test runner's (a root SRV,
+a root UAV and the root constants), so the manifest's table lines and the descriptor fetch are not exercised
+on the GPU. All 320 words are compared, including the sentinels. Four controls must each mismatch: swapping
+the X and Y group IDs, dropping the store, dropping case B's immediate offset, and dropping case C's exec
+predicate. The pure-Python controls refuse every reviewed input that was previously accepted: a modified
+descriptor word, an execz-skipped scalar write, an implicit-LOD sample and a misaligned immediate offset.
+
+Translating every cached graphics request before and after the descriptor-tracking change gave identical
+output and refusals. The local check covered 925 requests, 123 of which translate.
+
+On Windows 11 (26300), all 320 words matched in every case on WARP (10.0.26100.10068) and on an RTX 5090
+(32.0.16.2135), with the debug layer on.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_compute_' -V
+python -B tests/startup_gfx2hlsl_compute_check.py binary llvm-mc-15
+```
+
 ## Startup translator: refusal census
 
 The startup shader translator normally stops a pipeline at its first refusal. Fixing that refusal can expose gaps that were previously hidden, as documented in the [issue #1723 census](https://github.com/R0Y00/Xbox2Windows/issues/1723).
@@ -12217,12 +12299,21 @@ In straight-line code with a known `exec`, the proof follows `v_cvt_u32_f32`, `v
 
 Uniform sources include inline constants and literals, SGPRs holding constants, user data or fixed buffer words, other SGPRs tracked as uniform, and VGPRs with an existing proof. A scalar result is tracked as varying when its expression depends on `vcc`, `exec`, `m0`, a varying scalar register, a VGPR without a proof, or a varying `scc`. Descriptor, pointer, and sampler symbols, and SGPRs holding a lane mask (a compare result, even from uniform operands), are treated as non-uniform sources. A 64-bit move proves its high word only from the source high word as it was before the move, never when the destination overlaps it, and a descriptor-path move carries a high-word symbol only when that symbol does not depend on the register's run-time contents. SCC follows the same dependency tracking, with saveexec and wrexec marking it varying. A scalar write to `m0` that also sets SCC judges SCC from the write's sources, so `s_and_b32 m0, vcc_lo, -1` makes it varying while a write from uniform scalars makes it uniform. Instructions whose SCC result is not modelled (`s_add`, `s_sub`, `s_min` and `s_max`, `s_wqm`, and scalar ops on symbolic descriptor words, which emit nothing) mark SCC varying. Scalar buffer loads track the original offset across every destination word, including when the emitted code saves it in a temporary.
 
-An overwrite clears the destination's old proof unless the new value is proven uniform. This applies to SDWA forms and all three interpolation forms (`v_interp_p1_f32`, `v_interp_p2_f32`, and `v_interp_mov_f32`). Either WQM form, and restoring `exec` from a saved copy, clears all existing VGPR proofs because they can activate helper lanes. The read requires known `exec` and no modifiers. In a program with branches, the proof and the read are accepted only in the entry block: before the first branch target and before the first terminator. Every path reaches those instructions through the same instructions, so the program-order tracking is exact there. A branch back to the first instruction makes the whole program refuse, because a loop re-enters the entry block. It now explicitly checks for a single SGPR destination and a single VGPR source.
+An overwrite clears the destination's old proof unless the new value is proven uniform. This applies to SDWA forms and all three interpolation forms (`v_interp_p1_f32`, `v_interp_p2_f32`, and `v_interp_mov_f32`). Either WQM form, and restoring `exec` from a saved copy, clears all existing VGPR proofs because they can activate helper lanes. The read takes no modifiers. In straight-line code and in the entry block of a program with branches (before the first branch target and before the first terminator), the proof and the read require known `exec` and the read copies the VGPR; past the entry block the read recomputes the definition instead (below). Every path reaches those instructions through the same instructions, so the program-order tracking is exact there. A branch back to the first instruction ends the entry block at the first instruction, because a loop re-enters it. It now explicitly checks for a single SGPR destination and a single VGPR source.
 
-`tests/startup_gfx2hlsl_readfirstlane_uniform_check.py` translates short sequences through the stage's dispatch without shader machine code. It checks emitted assignments for the listed operations, supported modifiers, and in-place and cross-register chains, including the unsigned-division reciprocal estimate (`v_cvt_f32_u32`, `v_rcp_f32`, `v_mul_f32` by `0x4f7ffffe`, `v_cvt_u32_f32`) that compiled shaders read back with `v_readfirstlane_b32`. That chain stays refused from a lane-varying source or a lane mask, across an `exec` write or an overwrite, and from a definition in another block. Refusal cases cover varying sources and offsets, overwrites that invalidate a proof, WQM, a restored `exec` copy and other exec writes, lane masks, overlapping and descriptor-path 64-bit moves, branch and operand restrictions (a read at the first branch target, after the first terminator, or in an entry block re-entered by a loop), and constructor-less probes with incomplete tracking state. The negative control empties the allowlist and requires every accepted sequence to refuse.
+Past the entry block of a program with branches, the read does not copy the VGPR. It recomputes the uniform expression that defined the VGPR, for example `s9 = U(F(s3) * 2.0)` after `v_mul_f32 v7, s3, 2.0`. The value read is the first active lane's, and that lane ran the definition when nothing between the definition and the read could change which lanes ran it or what they computed:
+
+- no branch target lies between them (a join, a loop head or a back edge): a branch target clears every VGPR proof;
+- no instruction between them writes `exec`, explicitly or implicitly (`saveexec`, `wrexec`, `v_cmpx`, WQM, `s_movreld`); narrowing is refused as well as widening;
+- the VGPR is not written in between, and no SGPR that the expression reads is written in between (VOP3b carry-out destinations count);
+- every SGPR source was proven uniform since the last branch target, so a value from another path cannot reach it; an SCC from before the last branch target is not trusted.
+
+A lane that was inactive at the definition keeps an older VGPR value; the recomputed expression gives every lane the first active lane's value instead. `exec` need not be known at the definition. A conditional branch between the definition and the read is a fall-through, not a join, and is accepted. The one case where hardware can differ is a read with no active lane: it returns lane 0's VGPR, which the program cannot rely on. `tests/startup_gfx2hlsl_readfirstlane_recompute_check.py` checks the accepted forms and refuses each condition above, including a definition under a narrower `exec` than the read, a rewritten scalar input, a loop back edge and a join where two definitions reach.
+
+`tests/startup_gfx2hlsl_readfirstlane_uniform_check.py` translates short sequences through the stage's dispatch without shader machine code. It checks emitted assignments for the listed operations, supported modifiers, and in-place and cross-register chains, including the unsigned-division reciprocal estimate (`v_cvt_f32_u32`, `v_rcp_f32`, `v_mul_f32` by `0x4f7ffffe`, `v_cvt_u32_f32`) that compiled shaders read back with `v_readfirstlane_b32`. That chain stays refused from a lane-varying source or a lane mask, across an `exec` write or an overwrite, and from a definition in another block. Refusal cases cover varying sources and offsets, overwrites that invalidate a proof, WQM, a restored `exec` copy and other exec writes, lane masks, overlapping and descriptor-path 64-bit moves, branch and operand restrictions (a read at the first branch target, in a loop whose header is in the entry block, at a backward branch target, in an entry block re-entered by a loop, or after `s_endpgm` in a branch-free program; a read after the first terminator is recomputed), and constructor-less probes with incomplete tracking state. The negative control empties the allowlist and requires every accepted sequence to refuse.
 
 ```powershell
-ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_readfirstlane_uniform$' -V
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_readfirstlane_(uniform|recompute)$' -V
 ```
 
 ## Desktop audio render sink
@@ -12354,6 +12445,69 @@ announced, or rounding the tile rows down in `Bc16Surface`. The last also fails
 ```powershell
 cmake --build --preset release --target startup_stream_consumer startup_stub_consumer d3d12_xs_shim
 ctest --preset release --no-tests=error --output-on-failure -R '^(startup_address_(bc_view|srv)_(hardware|warp)|startup_xg_bc7_layout|startup_bc7_4k_s|bc7_tile_swizzle)$'
+```
+
+### Sample by-address textures of the non-XOR console layouts
+
+Slot 70 took a few texture shapes without a resource object (the R8 plane of an existing resource,
+the single texel, the `0x105` BC3/BC7 view above and the `0x109` BC chains below; those keep their
+own paths) and refused every other description, which leaves the destination descriptor as it was.
+It now also takes a two-dimensional,
+single-sample, sampled-only texture with a known element size whose layout is `0x101`, `0x102`,
+`0x105`, `0x106`, `0x109` or `0x10a`, and reads it in that console layout, mip tail and array slices
+included. Layout `0` and the linear mode `0x100` are refused as before: `startup_address_srv` still
+runs in the default configuration, and its mismatched-width and interior-address calls stay refused.
+The accepted descriptions, views, limits and log lines are listed in `docs/startup-runtime.md`
+("Textures published by address").
+
+`startup_gfx10_layout` needs no device. It compares `src/startup_stubs/gfx10_layout.h` with the 30
+one-pipe equations of AMD addrlib's `GFX10_SW_{256,4K,64K}_{S,D}_PATINFO` rows written out in the test
+(five element sizes for each of the six modes), with `bc7_4k_s.h` on five 4 KiB surfaces, with
+`bc64_chain.h` on eight 64 KiB chains and with `tile64_plan.h` on ten tile plans; it tiles and
+detiles nine textures back to their bytes, and lists 11 refused layouts, 19 slot 70 descriptions and
+21 views on each side of the accepted set. `startup_gfx10_layout_display_control` reads the `0x10a`
+order as `0x109` and must fail. The addrlib reference is the revision `tools/fetch_addrlib.py` pins
+(Mesa 25.1.0, commit `5c142e46f3f6e752ed745fd48912ebb8fad67145`, `src/amd/addrlib`, MIT); the files
+and their notice ("Copyright (C) 2007-2024 Advanced Micro Devices, Inc. All rights reserved.",
+`SPDX-License-Identifier: MIT`) are named in the header and in both fixtures.
+[AMD addrlib revision](https://gitlab.freedesktop.org/mesa/mesa/-/tree/5c142e46f3f6e752ed745fd48912ebb8fad67145/src/amd/addrlib)
+
+`startup_address_console_{warp,hardware}` builds the backing bytes in Python from the same addrlib
+rows, independently of the header, publishes them through slot 70 with no resource object, and
+compares all 65,536 RGBA pixels of a 512 by 128 target for each of seven textures: RGBA8 96 by 40
+and BC1 192 by 96 at `0x105`, BC1 256 by 128 at `0x10a`, mips 1, 2 and 3 of a four-mip RGBA8 256 by
+256 chain at `0x10a` (mips 2 and 3 are in the mip tail), and RGBA8 40 by 24 at `0x101`. Each run must
+also log `slot70 texture kind 1: published console layout`. Two held descriptions follow: the first
+texture again over an address announced as an XG copy of rows (`console_layout_xg_rows`), and
+RGBA8 257 by 257 at `0x109`, whose nine 64 KiB blocks run past the 393,216 bytes the XG stand-in
+reports (`console_layout_beyond_xg_size`). Both must log their reason, publish nothing and read the
+null view at every pixel. Last, the first texture is published and its address is then announced as
+an XG copy of rows before the draw; the published view must read the null view at every pixel, as
+a partial-tile BC view does after a later row copy.
+
+An upload of a console-layout texture owns its upload buffer. The buffer and the texture stay referenced
+by the recording and by each submit of it until the queue has completed that submit; the shared
+upload ring, which is reused without waiting for a queue, is not used. `startup_address_console_gate_{warp,hardware}`
+starts by closing and resetting an unsubmitted recording of payload 0, then records the identical bytes again. It makes the queue wait on a fence the fixture holds (queue slot 17), then records and submits eighteen
+lists on one list object, resetting the allocator and the list between them. Each republishes one
+2048 by 2048 RGBA8 texture at `0x109` (16 MiB) from the same address with a new payload and draws it,
+payload 0 over the left half of the target and the others over the right half. No submit may complete
+before the fixture signals the fence. After the last one completes, the left half must hold payload 0
+and the right half payload 17, and the log must report eighteen retained submits released.
+`startup_address_console_gate_ring_{warp,hardware}` is the control: with
+`X2W_TEST_ADDRESS_UPLOAD_RING=1` (fixtures only) the same uploads come from the 256 MiB ring, the
+later ones pass over the bytes of payload 0 before the queue copies them, and the left half must not
+hold payload 0.
+
+The equations are checked against addrlib and against the three existing layout headers, not against
+console memory. Which layouts a given console build writes for which textures is not established by
+these fixtures. The gate fixture covers one direct queue, one texture and uploads recorded by draws;
+it does not cover a release of the desktop texture, which this change never does.
+
+```powershell
+cmake --build --preset release --target startup_gfx10_layout_check startup_stream_consumer
+ctest --preset release --no-tests=error --output-on-failure -R '^startup_gfx10_layout'
+ctest --preset release --no-tests=error --output-on-failure -j 1 -R '^startup_address_(console|console_gate|console_gate_ring|bc_view|srv)_(hardware|warp)$'
 ```
 
 ### Six BC5/BC7 mips on a 64 KiB standard layout
