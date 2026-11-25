@@ -2648,8 +2648,8 @@ endforeach()
 # queues after one CPU write (both must see it), and follows a title-owned cross-queue fence without
 # deadlock. It also counts the backings in the D3D12 budget, keeps a buffer a submitted list copy wrote
 # (and refreshes one whose copy was discarded), orders a refresh behind an earlier read on another queue,
-# refuses a submission whose refresh would have to wait for a queue behind an unreached title Wait,
-# publishes two threads' refreshes in execution order, skips a buffer released and freed mid-refresh, and
+# refuses a submission whose refresh would have to wait for a queue behind an unreached title Wait (also
+# when that Wait and the submission behind it arrive on two threads), publishes two threads' refreshes in execution order, skips a buffer released and freed mid-refresh, and
 # defers XMem placements to the mesh XMem lease path when that is on. Each mutant removes one guarantee in
 # the DLL and must fail its case.
 add_executable(linear_buffer_backing_check tests/linear_buffer_backing_check.cpp)
@@ -2664,7 +2664,8 @@ foreach(adapter IN ITEMS warp hardware)
 endforeach()
 foreach(control IN ITEMS copy:skip_refresh copy:reuse_early copy:copy_gpu_writes refusal:ignore_feature
         copy:refusal_silent contention:hold_lock copy:skip_consumer_wait copy:refresh_gpu_written copy:gpuw_at_record
-        copy:skip_producer_wait copy:publish_out_of_order copy:copy_after_retire copy:accept_unsafe_refresh)
+        copy:skip_producer_wait copy:publish_out_of_order copy:copy_after_retire copy:accept_unsafe_refresh
+        copy:unlocked_title_wait)
     string(REPLACE ":" ";" parts "${control}")
     list(GET parts 0 path)
     list(GET parts 1 mutant)

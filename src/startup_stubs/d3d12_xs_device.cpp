@@ -1620,8 +1620,9 @@ extern "C" __declspec(dllexport) void x2w_d3d12_linear_buffer_totals(X2wLinearBu
     if (x2w_startup::linear_buffer_mode() != x2w_startup::LinearBufferMode::off) linear_buffers().totals(totals);
 }
 // Fixtures: the next refresh that reaches `point` (0 before staging, 1 after the title bytes are staged,
-// 2 after its copy was executed, before it is published) sets the `reached` event, then waits up to 20 s
-// for `resume`. Null events disarm the point. False with the switch off or for an unknown point.
+// 2 after its copy was executed, before it is published), or for point 3 the next title Wait (queue slot 17)
+// after its desktop Wait and before it is recorded, sets the `reached` event, then waits up to 20 s for
+// `resume`. Null events disarm the point. False with the switch off or for an unknown point.
 extern "C" __declspec(dllexport) bool x2w_d3d12_linear_buffer_test_pause(unsigned point, void* reached, void* resume)
 {
     return x2w_startup::linear_buffer_mode() != x2w_startup::LinearBufferMode::off &&
@@ -3657,6 +3658,15 @@ void linear_submitted(ID3D12CommandQueue* queue)
 {
     if (x2w_startup::linear_buffer_mode() != x2w_startup::LinearBufferMode::off) linear_buffers().after_submit(queue);
 }
+// The queue's order lock (linear_buffer_backing.h), so its title waits and user fence values are recorded in
+// the order the desktop queue receives them: held by a submission from its ExecuteCommandLists through
+// linear_submitted, and by queue slot 17 from the desktop Wait through note_title_wait. Taken before
+// draw_lock and allocator_lock and with no other lock held; nothing while the switch is off.
+x2w_startup::LinearBuffers::QueueOrder linear_queue_order(ID3D12CommandQueue* queue, bool title_wait)
+{
+    if (x2w_startup::linear_buffer_mode() == x2w_startup::LinearBufferMode::off) return {};
+    return linear_buffers().queue_order(queue, title_wait);
+}
 
 // Queue slot 10, desktop ExecuteCommandLists(count, lists).
 void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
@@ -3673,6 +3683,9 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
         // wait with it. A refused submission runs nothing: its recordings stay closed and submittable,
         // with their pending GPU writes (committed only after an executed submission).
         if (count && !linear_refresh(queue)) return;
+        // From here through linear_submitted, a title Wait on this queue (slot 17) on another thread is
+        // recorded either before this submission's user value or after it, as the desktop queue gets them.
+        auto order = linear_queue_order(queue, false);
         // Pin the closed recording and its allocator through submission bookkeeping.
         AcquireSRWLockExclusive(&draw_lock);
         AcquireSRWLockExclusive(&allocator_lock);
@@ -3723,6 +3736,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
         if (!ready.empty()) linear_submitted(queue);
         ReleaseSRWLockExclusive(&allocator_lock);
         ReleaseSRWLockExclusive(&draw_lock);
+        order.release();
         check_device("CommandQueue execute", 35);
         return;
     }
@@ -3735,8 +3749,11 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
     for (UINT i = 0; i < count; ++i) real[i] = reinterpret_cast<ID3D12CommandList*>(unwrap(reinterpret_cast<u64>(lists[i])));
     auto* queue = static_cast<ID3D12CommandQueue*>(self->own().real);
     if (!linear_refresh(queue)) return;
-    queue->ExecuteCommandLists(count, real.data());
-    if (count) linear_submitted(queue);
+    {
+        const auto order = linear_queue_order(queue, false);  // as in render mode above
+        queue->ExecuteCommandLists(count, real.data());
+        if (count) linear_submitted(queue);
+    }
     if (first_calls(calls)) log("x2w-d3d12 CommandQueue::ExecuteCommandLists count=%u", count);
 }
 
@@ -3852,11 +3869,17 @@ u64 __stdcall queue_wait(Wrapper* self, u64 rdx, u64 r8, u64 r9)
     Wrapper* fence = as_wrapper(reinterpret_cast<void*>(rdx));
     if (!fence || fence->own().kind != fence_kind) return queue_dynamic<17>(self, rdx, r8, r9);
     InterlockedExchange(&self->own().queue_wait_seen, 1);
-    const HRESULT hr = static_cast<ID3D12CommandQueue*>(self->own().real)->Wait(static_cast<ID3D12Fence*>(fence->own().real), r8);
+    auto* queue = static_cast<ID3D12CommandQueue*>(self->own().real);
     // X2W_D3D12_LINEAR_BUFFERS: until this wait is reached, a submission whose refresh would have to wait for a
-    // submission behind it is refused.
-    if (SUCCEEDED(hr) && x2w_startup::linear_buffer_mode() != x2w_startup::LinearBufferMode::off)
-        linear_buffers().note_title_wait(static_cast<ID3D12CommandQueue*>(self->own().real), static_cast<ID3D12Fence*>(fence->own().real), r8);
+    // submission behind it is refused. The queue's order lock spans the desktop Wait and its record, so a
+    // submission on this queue from another thread takes its user value wholly before or after both.
+    HRESULT hr;
+    {
+        const auto order = linear_queue_order(queue, true);
+        hr = queue->Wait(static_cast<ID3D12Fence*>(fence->own().real), r8);
+        if (SUCCEEDED(hr) && x2w_startup::linear_buffer_mode() != x2w_startup::LinearBufferMode::off)
+            linear_buffers().note_title_wait(queue, static_cast<ID3D12Fence*>(fence->own().real), r8);
+    }
     static LONG calls;
     if (first_calls(calls, 2))
         log("x2w-d3d12 CommandQueue::slot17(fence=%p, value=0x%llx) -> Wait 0x%08lx", static_cast<void*>(fence), r8,

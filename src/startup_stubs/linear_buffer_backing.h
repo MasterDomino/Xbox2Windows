@@ -74,6 +74,24 @@
 // changed bytes to refresh is never refused; it waits only for refreshes already enqueued, none of which
 // waits for a blocked queue.
 //
+// The refusal is only as good as the record of which submissions sit behind which title Wait, and a
+// title can call slot 17 and ExecuteCommandLists on one queue from two threads at once. Each queue's
+// record therefore has an order lock (queue_order), so its title waits and user fence values are
+// recorded in the order the desktop queue received them. Slot 17 holds it from the desktop Wait through
+// note_title_wait; a submission holds it from the title's ExecuteCommandLists through after_submit's
+// user fence Signal. Without it a submission could reach the desktop queue behind a Wait yet take its
+// user value before that Wait was recorded, which would then count only later submissions as behind it:
+// another queue's refresh would wait for the blocked submission instead of being refused. The lock is
+// not held across the refresh (its staging waits and fixture pauses run without it), and nothing that
+// waits on the CPU for the GPU runs under it, since a desktop Wait, ExecuteCommandLists and Signal only
+// enqueue. The title's Signal (slot 16, or a shape-dispatched Signal) does not take it, so a queue whose
+// submission was refused can still signal the fence its blocked peer waits on. The order is: a queue's
+// order lock, then draw_lock and allocator_lock (render mode), then mutex_; mutex_ is never held while it
+// is taken (queue_order looks the lock up under mutex_ and takes it after releasing mutex_). A refresh
+// decision that runs while a Wait on another queue has been enqueued but not yet recorded is still safe:
+// that Wait precedes only submissions whose user value is not yet assigned, and a refresh waits only for
+// values already assigned.
+//
 // A staging buffer is reused only after the internal fence value of the copy that read it has
 // completed (title fences do not matter: only that copy reads it). If the internal queue or its fence
 // cannot be created, the copy cannot order its consumers: placements keep the default backing and
@@ -138,9 +156,12 @@
 //                      then catches the read of a released buffer's freed pages)
 //     accept-unsafe-refresh  a refresh with no safe completion order is enqueued without waiting for the
 //                      blocked queue instead of refusing the submission (its copy may overlap that read)
+//     unlocked-title-wait  queue slot 17 does not take the queue's order lock (a submission on another
+//                      thread can take its user value between the desktop Wait and its record)
 //   x2w_d3d12_linear_buffer_test_pause      parks the next refresh at one point (before staging, after
 //                                          staging, after its copy executed), so a fixture can order two
-//                                          threads' refreshes or release a buffer while one is parked
+//                                          threads' refreshes or release a buffer while one is parked;
+//                                          or the next title Wait between the desktop Wait and its record
 //   x2w_d3d12_linear_buffer_internal_queue  returns the internal queue, so a fixture can hold refreshes
 //   X2W_TEST_LINEAR_STAGING_LIMIT=<n>      the staging pool holds n buffers instead of 256
 //   X2W_TEST_LINEAR_REFRESH_FAIL=<n>       staging requests 2, 2 + n, 2 + 2n, ... fail with E_OUTOFMEMORY
@@ -153,6 +174,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -518,7 +540,8 @@ public:
     // After the title's lists were executed on `queue` (a queue wrapper): signals that queue's user fence,
     // so a later refresh can be ordered behind this submission (the producer wait). Nothing before the
     // first copied placement: earlier submissions cannot name a copied backing that did not exist yet.
-    // Not called for a refused submission: its lists did not run, so no user value stands for them.
+    // Not called for a refused submission: its lists did not run, so no user value stands for them. The
+    // caller holds the queue's order lock from its ExecuteCommandLists through this call.
     void after_submit(ID3D12CommandQueue* queue)
     {
         std::lock_guard lock(mutex_);
@@ -550,9 +573,10 @@ public:
 
     // The title enqueued Wait(fence, value) on `queue` (queue slot 17, already forwarded). Recorded until the
     // fence reaches the value: a refresh that would have to wait for a submission behind it is refused (see
-    // the producer wait).
+    // the producer wait). The caller holds the queue's order lock from the desktop Wait through this call.
     void note_title_wait(ID3D12CommandQueue* queue, ID3D12Fence* fence, UINT64 value)
     {
+        pause_at(pause_title_wait);
         if (!fence || fence->GetCompletedValue() >= value) return;
         std::lock_guard lock(mutex_);
         UserQueue* user = user_queue(queue);
@@ -568,12 +592,54 @@ public:
         }
     }
 
+    // A queue's order lock, held until destroyed or release() (an empty one holds nothing).
+    class QueueOrder {
+    public:
+        QueueOrder() = default;
+        explicit QueueOrder(SRWLOCK* lock) : lock_(lock)
+        {
+            if (lock_) AcquireSRWLockExclusive(lock_);
+        }
+        QueueOrder(QueueOrder&& other) noexcept : lock_(other.lock_) { other.lock_ = nullptr; }
+        QueueOrder(const QueueOrder&) = delete;
+        QueueOrder& operator=(const QueueOrder&) = delete;
+        QueueOrder& operator=(QueueOrder&&) = delete;
+        ~QueueOrder() { release(); }
+        void release()
+        {
+            if (lock_) ReleaseSRWLockExclusive(lock_);
+            lock_ = nullptr;
+        }
+
+    private:
+        SRWLOCK* lock_ = nullptr;
+    };
+
+    // Takes the order lock of `queue` (see the order lock above): queue slot 17 (title_wait) across the
+    // desktop Wait and note_title_wait, a queue wrapper's submission across the title's ExecuteCommandLists
+    // and after_submit. The caller holds none of this file's locks, nor draw_lock or allocator_lock. A queue
+    // whose record cannot be stored shares one fallback lock.
+    [[nodiscard]] QueueOrder queue_order(ID3D12CommandQueue* queue, bool title_wait)
+    {
+        // Mutant: slot 17 takes no lock, so a submission on another thread can take its user value between
+        // the desktop Wait and its record.
+        if (title_wait && linear_detail::mutant("unlocked-title-wait")) return QueueOrder{};
+        SRWLOCK* lock = &order_fallback_;
+        {
+            std::lock_guard guard(mutex_);
+            if (UserQueue* user = user_queue(queue)) lock = &user->order;
+        }
+        return QueueOrder(lock);
+    }
+
     // Fixtures only (x2w_d3d12_linear_buffer_test_pause): the next refresh that reaches `point` sets
     // `reached`, then waits up to 20 s for `resume`, holding no lock. One shot per arming. The points:
     // before its staging (after the snapshot), after the title bytes are staged (before its copy is
-    // executed), and after the copy is executed and signalled (before it is published). Null events
-    // disarm the point, so a fixture can close its events when no refresh came.
-    enum PausePoint : unsigned { pause_before_stage, pause_after_stage, pause_after_execute, pause_points };
+    // executed), and after the copy is executed and signalled (before it is published). The last point
+    // parks the next title Wait (queue slot 17) after the desktop Wait and before note_title_wait records
+    // it, holding that queue's order lock (and nothing else). Null events disarm the point, so a fixture can
+    // close its events when nothing came.
+    enum PausePoint : unsigned { pause_before_stage, pause_after_stage, pause_after_execute, pause_title_wait, pause_points };
     bool arm_pause(unsigned point, HANDLE reached, HANDLE resume)
     {
         if (point >= pause_points) return false;
@@ -654,8 +720,10 @@ private:
         UINT64 value, before;
     };
     // A queue wrapper's desktop queue, its user fence (signalled after each submission of the title's
-    // lists) and the title waits it may still sit behind. Kept for the process, as the queues are.
+    // lists), the title waits it may still sit behind and its order lock (queue_order). Kept for the
+    // process, as the queues are, at a stable address (users_ is a deque that only grows).
     struct UserQueue {
+        SRWLOCK order = SRWLOCK_INIT;
         ID3D12CommandQueue* queue = nullptr;
         ID3D12Fence* fence = nullptr;
         UINT64 value = 0;        // the latest submission's user fence value (0: none yet)
@@ -1169,7 +1237,8 @@ private:
     std::vector<std::unique_ptr<RefreshList>> internal_lists_;
     std::vector<std::unique_ptr<Staging>> staging_;
     std::vector<Heap> heaps_;
-    std::vector<UserQueue> users_;  // under mutex_
+    std::deque<UserQueue> users_;  // under mutex_; elements never move (their order locks are held outside it)
+    SRWLOCK order_fallback_ = SRWLOCK_INIT;  // the order lock of a queue whose record could not be stored
     struct Pause {
         HANDLE reached = nullptr, resume = nullptr;
     };

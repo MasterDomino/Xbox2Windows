@@ -89,6 +89,11 @@
 //        have to wait for queue 1, behind the unreached fence), so the submission is refused: unsafe refresh
 //        refusals +1 and logged, its result slot keeps P. The title's Signal through queue 2's wrapper (slot
 //        16) releases queue 1, which reads A; the refused recording submitted again on queue 2 reads B.
+//   xq.race (copy only) xq.write with queue 1's title Wait and its read of A on two threads: the Wait is parked
+//        through x2w_d3d12_linear_buffer_test_pause (point 3) after the desktop Wait and before it is recorded,
+//        and the read is submitted meanwhile. The read is behind the fence on the desktop queue, so queue 2's
+//        read must still be refused, queue 2 must still signal the fence, queue 1 must read A and the
+//        resubmission B. A queue that does not complete within 3 s is released by a CPU Signal of the fence.
 //   order (copy only) two threads refresh one buffer, parked through x2w_d3d12_linear_buffer_test_pause:
 //        thread A stages C and parks before its copy executes; the CPU writes D; thread B stages D, executes
 //        first and parks before publishing; A executes (the backing ends with C) and publishes, B publishes
@@ -115,12 +120,15 @@
 //   skip-producer-wait (copy) case war (the refresh's copy lands before queue 1's earlier read),
 //   publish-out-of-order (copy) case order (B's older publish is applied after A's: no further refresh),
 //   copy-after-retire (copy) case retire (no probe before staging: the fault guard catches the read),
-//   accept-unsafe-refresh (copy) case xq.write (the refresh skips the blocked queue: queue 2 runs and both read B).
+//   accept-unsafe-refresh (copy) case xq.write (the refresh skips the blocked queue: queue 2 runs and both read B),
+//   unlocked-title-wait (copy) case xq.race (slot 17 takes no order lock: the read takes its user value before the
+//   Wait is recorded, queue 2's refresh is accepted and waits for queue 1, and both stay pending until the CPU
+//   signals the fence).
 //
 // Refreshes run on an internal COPY queue that the DLL exports to fixtures
 // (x2w_d3d12_linear_buffer_internal_queue); cases c, contention and gate2q.held hold it behind a fence
 // of their own to keep a refresh in flight. Cases order and retire park a refresh on its thread through
-// x2w_d3d12_linear_buffer_test_pause.
+// x2w_d3d12_linear_buffer_test_pause, and xq.race parks a title Wait.
 // The run then exits 1 only if every targeted case failed, else 0 (negative controls, WILL_FAIL).
 // X2W_TEST_DEBUG_LAYER=1 enables the D3D12 debug layer; any stored error fails the run.
 // Returns 0 on pass, 1 on failure, 77 without the adapter, or on the share path when the adapter
@@ -396,6 +404,17 @@ bool wait_fence(ID3D12Fence* fence, UINT64 value)
     const bool ok = event && SUCCEEDED(fence->SetEventOnCompletion(value, event)) && WaitForSingleObject(event, 20000) == WAIT_OBJECT_0;
     if (event) CloseHandle(event);
     return ok;
+}
+// Polls instead of registering an event, for a wait that is expected to time out in a negative control (a
+// registration left on a closed handle could later set an unrelated event that reuses it).
+bool poll_fence(ID3D12Fence* fence, UINT64 value, DWORD timeout_ms)
+{
+    const ULONGLONG deadline = GetTickCount64() + timeout_ms;
+    while (fence->GetCompletedValue() < value) {
+        if (GetTickCount64() >= deadline) return false;
+        Sleep(1);
+    }
+    return true;
 }
 
 struct Gpu {
@@ -1280,6 +1299,106 @@ struct Run {
                 std::to_string(after.unsafe_refresh_refusals - mid.unsafe_refresh_refusals) + (x.info.stale ? ", STALE" : ""));
     }
 
+    // xq.race: xq.write with the title Wait and the read of A on queue 1 issued from two threads at once (the
+    // review repro). Thread W calls slot 17 Wait(F, 1) on queue 1 and parks through the pause hook (point 3)
+    // after the desktop Wait and before the wait is recorded. While it is parked, thread S submits the read of A
+    // on queue 1; the fixture gives it up to 1 s to return before W resumes (S must not take a user value that
+    // the wait would then be recorded after). Once both returned the CPU writes B and queue 2 submits a read:
+    // queue 1's read is behind F on the desktop queue, so this refresh has no safe completion order and must be
+    // refused, as in xq.write (refusals +1, its slot keeps P, queue 2's own fence is reached). The title's
+    // Signal(F, 1) through queue 2's wrapper must succeed and release queue 1, which reads A; the refused
+    // recording submitted again then reads B. Every wait is bounded: when queue 2 or queue 1 does not complete,
+    // the fixture signals F from the CPU (the same fence) so both drain, and the row fails.
+    void case_xq_race(Pool& pool)
+    {
+        const char* name = "xq.race";
+        Lane q2;
+        Memory memory;
+        ComPtr<IUnknown> fence;
+        if (!gpu.lane(q2, D3D12_COMMAND_LIST_TYPE_DIRECT) || !pool.allocate(memory, A) ||
+            FAILED(static_cast<HRESULT>(invoke(gpu.guest.Get(), 36, 0, D3D12_FENCE_FLAG_NONE, arg(&__uuidof(ID3D12Fence)),
+                                               arg(fence.GetAddressOf())))) || !fence)
+            return row(pool, name, false, "setup failed");
+        Placed x = place(gpu, memory.buffer(), false);
+        TitleList l0, l1, l2;
+        if (FAILED(x.hr) || !x.backing || !l0.begin(gpu) || !l1.begin(gpu) || !l2.begin(gpu))
+            return row(pool, name, false, "slot 133 -> " + hex(x.hr));
+        l0.read(x.backing.Get());
+        l0.close();
+        if (!gpu.wait(l0.submit())) return row(pool, name, false, "fence timeout");  // A uploaded and read
+        l1.read(x.backing.Get(), 1);
+        l1.close();
+        l2.read(x.backing.Get(), 2);
+        l2.close();
+        if (!gpu.fill_output(1, P) || !gpu.fill_output(2, P)) return row(pool, name, false, "result slot could not be filled");
+        HANDLE parked = CreateEventW(nullptr, TRUE, FALSE, nullptr), go = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        HANDLE s_returned = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        const auto close_events = [&] {
+            x2w_d3d12_linear_buffer_test_pause(3, nullptr, nullptr);  // disarm, if no wait reached it
+            for (HANDLE h : {parked, go, s_returned})
+                if (h) CloseHandle(h);
+        };
+        if (!parked || !go || !s_returned || !x2w_d3d12_linear_buffer_test_pause(3, parked, go)) {
+            close_events();
+            return row(pool, name, false, "pause hook not available");
+        }
+        const X2wLinearBufferTotals before = totals();
+        HRESULT wait_hr = E_FAIL;
+        std::thread tw([&] { wait_hr = static_cast<HRESULT>(invoke(gpu.guest_queue.Get(), 17, arg(fence.Get()), 1)); });
+        const bool w_parked = WaitForSingleObject(parked, 5000) == WAIT_OBJECT_0;
+        UINT64 v1 = 0;
+        std::thread ts([&] {
+            v1 = l1.submit();  // queue 1: the unchanged read of A, behind F on the desktop queue
+            SetEvent(s_returned);
+        });
+        // With the order lock S cannot return while W is parked; without it, it returns at once.
+        const bool s_returned_while_parked = WaitForSingleObject(s_returned, 1000) == WAIT_OBJECT_0;
+        SetEvent(go);
+        tw.join();
+        ts.join();  // bounded: W's park ends after 20 s at most, and S waits only for W
+        close_events();
+        write(memory.buffer(), r0, B, words);
+        const UINT64 v2 = l2.submit_on(q2);  // needs a refresh of B, which would wait for queue 1: must be refused
+        const bool q2_progress = poll_fence(q2.fence.Get(), v2, 3000);
+        const bool q1_pending = gpu.done->GetCompletedValue() < v1;
+        const X2wLinearBufferTotals mid = totals();
+        const Tally refused = tally(gpu.read_output(2).data(), r0 / 4, key);
+        // The title's Signal through queue 2's wrapper releases queue 1.
+        const HRESULT signal_hr = static_cast<HRESULT>(invoke(q2.guest.Get(), 16, arg(fence.Get()), 1));
+        const bool q1_done = poll_fence(gpu.done.Get(), v1, 3000);
+        const UINT64 refusals = mid.unsafe_refresh_refusals - before.unsafe_refresh_refusals;
+        std::string text = std::string("W ") + (w_parked ? "parked" : "DID NOT PARK") + " between its desktop Wait and its record (slot 17 -> " +
+                           hex(wait_hr) + "); S's read of A on queue 1 " +
+                           (s_returned_while_parked ? "RETURNED WHILE W WAS PARKED" : "waited for W") + "; after the CPU wrote B, queue 2's read was " +
+                           (refusals == 1 ? "refused" : "NOT REFUSED") + " (refusals +" + std::to_string(refusals) + "), its slot " +
+                           refused.text() + " (expected P), queue 2 " + (q2_progress ? "progressed" : "STUCK") +
+                           "; the title's Signal on queue 2 (slot 16) -> " + hex(signal_hr) + ", queue 1 " +
+                           (q1_done ? "completed" : "STILL PENDING");
+        if (!q2_progress || !q1_done) {
+            // Cleanup: the CPU reaches F (fence slot 10), so both queues drain before the next case.
+            invoke(fence.Get(), 10, 1);
+            const bool drained = wait_fence(gpu.done.Get(), v1) && wait_fence(q2.fence.Get(), v2);
+            const Tally t1 = tally(gpu.read_output(1).data(), r0 / 4, key), t2 = tally(gpu.read_output(2).data(), r0 / 4, key);
+            return row(pool, name, false,
+                       text + "; after a CPU Signal of F both " + (drained ? "drained" : "STILL DID NOT DRAIN") + ": queue 1 read " + t1.text() +
+                           ", queue 2 read " + t2.text());
+        }
+        const Tally t1 = tally(gpu.read_output(1).data(), r0 / 4, key);
+        // A later, safe submission: the refused recording again, with no submission behind a title Wait.
+        const UINT64 v3 = l2.submit_on(q2);
+        if (!wait_fence(q2.fence.Get(), v3)) return row(pool, name, false, text + "; fence timeout (queue 2, resubmission)");
+        const Tally t2 = tally(gpu.read_output(2).data(), r0 / 4, key);
+        refresh_info(x);
+        const X2wLinearBufferTotals after = totals();
+        const bool pass = w_parked && SUCCEEDED(wait_hr) && q1_pending && q2_progress && refusals == 1 && refused.count[P] == words &&
+                          SUCCEEDED(signal_hr) && t1.count[A] == words && t2.count[B] == words &&
+                          after.unsafe_refresh_refusals == mid.unsafe_refresh_refusals && !x.info.stale && x.info.refresh_failures == 0;
+        row(pool, name, pass,
+            text + " and read " + t1.text() + " (expected A); the refused recording resubmitted on queue 2 read " + t2.text() +
+                " (expected B), refusals +" + std::to_string(after.unsafe_refresh_refusals - mid.unsafe_refresh_refusals) +
+                (x.info.stale ? ", STALE" : ""));
+    }
+
     // order: two threads' refreshes of one buffer, driven through the pause hook. Thread A stages C and parks
     // before its copy is executed; the CPU writes D; thread B stages D, executes its copy first (the lower
     // internal value) and parks before publishing; A then executes (the higher value: the backing ends with C)
@@ -1754,6 +1873,7 @@ int main(int argc, char** argv)
             run.case_gpuw_discard(pool);
             run.case_war(pool);
             run.case_xq_write(pool);
+            run.case_xq_race(pool);
             run.case_order(pool);
             run.case_retire(pool);  // last: it frees the pages of one buffer
         }
@@ -1815,7 +1935,8 @@ int main(int argc, char** argv)
                            : mutant == "hold-lock" ? "contention" : mutant == "skip-consumer-wait" ? "gate2q.held"
                            : mutant == "refresh-gpu-written" ? "gpuw" : mutant == "gpuw-at-record" ? "gpuw.discard"
                            : mutant == "skip-producer-wait" ? "war" : mutant == "publish-out-of-order" ? "order"
-                           : mutant == "copy-after-retire" ? "retire" : mutant == "accept-unsafe-refresh" ? "xq.write" : nullptr;
+                           : mutant == "copy-after-retire" ? "retire" : mutant == "accept-unsafe-refresh" ? "xq.write"
+                           : mutant == "unlocked-title-wait" ? "xq.race" : nullptr;
         if (!target) return 2;
         unsigned targeted = 0, failed = 0;
         for (const auto& [name, pass] : run.results)
