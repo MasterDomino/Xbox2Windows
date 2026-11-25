@@ -76,6 +76,8 @@
 //        waiting refresh has taken that buffer again (none is created), and both gated reads see C.
 //   budget (share, copy) with X2W_D3D12_BUDGET=1: a shared buffer counts as placed memory (its heap
 //        live), a copied one as a committed buffer; live while held, retained after the title's release.
+//   gpuw (copy only) a recorded copy (list slot 15) writes G into a copied buffer, then the title changes
+//        its first and last words: the buffer keeps G (it is no longer refreshed), reported as gpu_written.
 //   lease (lease only) an XMem buffer keeps the default backing with HRESULT_FROM_WIN32(ERROR_BUSY)
 //        reported (old behaviour: reads zero); a private one is copied and reads B.
 //   pin  (share, XMem; measured, not asserted) a heap opened from an XMem view and a buffer placed on
@@ -89,7 +91,8 @@
 //   skip-refresh (copy) case a, reuse-early (copy) case c, copy-gpu-writes (copy) case b,
 //   ignore-feature (refusal) case gate, refusal-silent (copy) case b (the kept default is not reported),
 //   hold-lock (contention) case contention (the wait keeps the backing's lock held),
-//   skip-consumer-wait (copy) case gate2q.held (no submission waits for the internal fence).
+//   skip-consumer-wait (copy) case gate2q.held (no submission waits for the internal fence),
+//   refresh-gpu-written (copy) case gpuw (a refresh spanning the written words copies the title's A over G).
 //
 // Refreshes run on an internal COPY queue that the DLL exports to fixtures
 // (x2w_d3d12_linear_buffer_internal_queue); cases c, contention and gate2q.held hold it behind a fence
@@ -1061,6 +1064,39 @@ struct Run {
     }
 
     // xq: queue 1 waits on a title fence that queue 2 signals after its list.
+    // gpuw: a recorded copy (list slot 15, CopyBufferRegion) writes G into a copied buffer; the title then
+    // changes bytes on both sides of it. The buffer keeps the GPU's bytes (no refresh spans them), and
+    // info and totals report it.
+    void case_gpuw(Pool& pool)
+    {
+        Memory memory;
+        if (!pool.allocate(memory, A)) return row(pool, "gpuw", false, "allocation failed");
+        Placed p = place(gpu, memory.buffer(), false);
+        TitleList l0, l1, l2;
+        if (FAILED(p.hr) || !p.backing || !l0.begin(gpu) || !l1.begin(gpu) || !l2.begin(gpu))
+            return row(pool, "gpuw", false, "slot 133 -> " + hex(p.hr));
+        l0.read(p.backing.Get());
+        l0.close();
+        if (!gpu.wait(l0.submit())) return row(pool, "gpuw", false, "fence timeout");  // A uploaded
+        const X2wLinearBufferTotals before = totals();
+        // The title's copy, through the list wrapper: G (indexed as at r1) into the buffer at r0.
+        invoke(l1.list.Get(), 15, arg(p.wrapper.Get()), r0, arg(gpu.source.Get()), 0, region_bytes);
+        if (!l1.close() || !gpu.wait(l1.submit())) return row(pool, "gpuw", false, "copy submission failed");
+        write(memory.buffer(), 0, D, 1);                 // the first and last words, around the written region
+        write(memory.buffer(), buffer_bytes - 4, D, 1);
+        l2.read(p.backing.Get(), 1);
+        l2.close();
+        if (!gpu.wait(l2.submit())) return row(pool, "gpuw", false, "fence timeout");
+        const Tally t = tally(gpu.read_output(1).data(), r1 / 4, key);  // G words carry their r1 indices
+        refresh_info(p);
+        const X2wLinearBufferTotals after = totals();
+        const bool pass = p.linear && p.info.path == 2 && p.info.gpu_written == 1 && t.count[G] == words &&
+                          after.gpu_written == before.gpu_written + 1;
+        row(pool, "gpuw", pass,
+            "after a recorded copy of G and title writes around it the GPU read " + t.text() + " (expected G: not refreshed); " +
+                "gpu_written " + std::to_string(p.info.gpu_written) + ", totals +" + std::to_string(after.gpu_written - before.gpu_written));
+    }
+
     // lease: with the mesh XMem lease path on, an XMem placement with console flags 0 is the lease path's:
     // slot 133 keeps the default backing (not aliased) and records the deferral; a private one is copied.
     void case_lease(Pool& pool)
@@ -1405,6 +1441,7 @@ int main(int argc, char** argv)
             run.case_gate2q(pool, true);
             run.case_xq(pool);
             run.case_budget(pool);
+            run.case_gpuw(pool);
         }
         run.probe_view_pin(pool);
         if (path == Path::share) run.case_budget(pool);
@@ -1457,7 +1494,8 @@ int main(int argc, char** argv)
     if (!mutant.empty()) {
         const char* target = mutant == "skip-refresh" ? "a" : mutant == "reuse-early" ? "c" : mutant == "copy-gpu-writes" ? "b"
                            : mutant == "ignore-feature" ? "gate" : mutant == "refusal-silent" ? "b"
-                           : mutant == "hold-lock" ? "contention" : mutant == "skip-consumer-wait" ? "gate2q.held" : nullptr;
+                           : mutant == "hold-lock" ? "contention" : mutant == "skip-consumer-wait" ? "gate2q.held"
+                           : mutant == "refresh-gpu-written" ? "gpuw" : nullptr;
         if (!target) return 2;
         unsigned targeted = 0, failed = 0;
         for (const auto& [name, pass] : run.results)

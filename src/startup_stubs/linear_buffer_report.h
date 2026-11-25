@@ -21,7 +21,7 @@ struct X2wLinearBufferInfo {
     std::uint64_t last_fence;       // copied: internal fence value of the last refresh (0: none)
     std::uint64_t refresh_failures; // copied: submissions that ran without this buffer's refresh
     std::int32_t last_refresh_hr;   // copied: HRESULT of the last failed refresh; S_OK if none
-    std::int32_t reserved;
+    std::uint32_t gpu_written;      // copied: 1 once a recorded copy wrote it; it is no longer refreshed
 };
 
 struct X2wLinearBufferTotals {
@@ -30,5 +30,6 @@ struct X2wLinearBufferTotals {
     std::uint64_t submissions, refreshes, bytes_copied, staging_created, staging_reused, unreadable;
     std::uint64_t refresh_failures;
     std::uint64_t consumer_waits;   // submissions made to Wait for a refresh on the internal queue
+    std::uint64_t gpu_written;      // copied buffers that a recorded copy wrote (held from then on)
     std::int32_t last_refusal_hr, last_refresh_hr;
 };

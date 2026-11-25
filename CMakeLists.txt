@@ -2605,7 +2605,7 @@ foreach(adapter IN ITEMS warp hardware)
     endforeach()
 endforeach()
 foreach(control IN ITEMS copy:skip_refresh copy:reuse_early copy:copy_gpu_writes refusal:ignore_feature
-        copy:refusal_silent contention:hold_lock copy:skip_consumer_wait)
+        copy:refusal_silent contention:hold_lock copy:skip_consumer_wait copy:refresh_gpu_written)
     string(REPLACE ":" ";" parts "${control}")
     list(GET parts 0 path)
     list(GET parts 1 mutant)

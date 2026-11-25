@@ -80,6 +80,12 @@
 // refresh succeeds; the HRESULT is logged (the first few times) and kept in the buffer's info and the
 // totals (refresh_failures, last_refresh_hr).
 //
+// A copied buffer that a recorded copy writes (list CopyBufferRegion or CopyResource, list_copy.inl)
+// keeps the GPU's bytes from that recording on: it is no longer refreshed. The title memory never
+// receives those bytes, and a later refresh that spans them would copy the title's older bytes over
+// them. This is what the default backing does for such a buffer; info and totals report it
+// (gpu_written).
+//
 // Fixtures only:
 //   X2W_TEST_EXISTING_HEAPS_UNSUPPORTED=1  the feature query reports no support (an adapter such as
 //                                          Intel Gen9 reports EXISTING_HEAPS = 0).
@@ -91,6 +97,7 @@
 //     refusal-silent   a kept default backing is not reported (no log text, info or totals)
 //     hold-lock        the wait for a full staging pool keeps mutex_ held (other callers block)
 //     skip-consumer-wait  submissions do not Wait for the internal fence (consumers race refreshes)
+//     refresh-gpu-written  a copied buffer that a recorded copy wrote is still refreshed
 //   x2w_d3d12_linear_buffer_internal_queue  returns the internal queue, so a fixture can hold refreshes
 //   X2W_TEST_LINEAR_STAGING_LIMIT=<n>      the staging pool holds n buffers instead of 256
 //   X2W_TEST_LINEAR_REFRESH_FAIL=<n>       staging requests 2, 2 + n, 2 + 2n, ... fail with E_OUTOFMEMORY
@@ -331,6 +338,21 @@ public:
         }
     }
 
+    // A recorded copy writes the backing of `resource` (list_copy.inl): if it is a copied buffer, it keeps
+    // the GPU's bytes from now on and is no longer refreshed from the title memory.
+    void note_gpu_write(ID3D12Resource* resource)
+    {
+        if (linear_detail::mutant("refresh-gpu-written")) return;
+        std::lock_guard lock(mutex_);
+        const auto found = records_.find(resource);
+        if (found == records_.end() || !found->second.copy || found->second.copy->gpu_written) return;
+        found->second.copy->gpu_written = true;
+        ++totals_.gpu_written;
+        if (x2w_local::first_calls(gpu_write_logged_, 8))
+            x2w_local::logf("x2w-d3d12 linear buffer %p: a recorded copy writes it; it keeps the GPU's bytes and is no "
+                            "longer refreshed from title memory", static_cast<void*>(resource));
+    }
+
     // The resource never reached the title and is about to be released.
     void discard(ID3D12Resource* resource)
     {
@@ -378,7 +400,7 @@ public:
             if (!any || !internal_queue_) return;
             for (auto& [resource, record] : records_) {
                 const std::shared_ptr<Copied>& copy = record.copy;
-                if (!copy || !copy->live) continue;
+                if (!copy || !copy->live || copy->gpu_written) continue;
                 const std::size_t bytes = static_cast<std::size_t>(copy->bytes);
                 const unsigned char* source = copy->bound.empty() ? copy->title : copy->bound.data();
                 if (copy->bound.empty() && x2w_local::probe_readable(reinterpret_cast<std::uintptr_t>(source), bytes) < bytes) {
@@ -448,6 +470,7 @@ public:
             out->last_staging = copy->last_staging;
             out->last_fence = copy->refresh_value;
             out->stale = copy->stale ? 1 : 0;
+            out->gpu_written = copy->gpu_written ? 1 : 0;
             out->refresh_failures = copy->refresh_failures;
             out->last_refresh_hr = copy->last_refresh_hr;
         }
@@ -470,6 +493,7 @@ private:
         UINT64 refreshes = 0, bytes_copied = 0, last_staging = 0, refresh_failures = 0;
         UINT64 refresh_value = 0;  // internal fence value of the last enqueued refresh
         bool stale = false;
+        bool gpu_written = false;  // a recorded copy wrote it: not refreshed any more
         HRESULT last_refresh_hr = S_OK;
     };
     struct Record {
@@ -837,7 +861,7 @@ private:
     UINT64 generation_ = 0, staging_ids_ = 0, staging_requests_ = 0;
     std::size_t creating_ = 0;  // staging buffers being created outside the lock
     X2wLinearBufferTotals totals_{};
-    volatile LONG unreadable_logged_ = 0, wait_logged_ = 0, refresh_logged_ = 0;
+    volatile LONG unreadable_logged_ = 0, wait_logged_ = 0, refresh_logged_ = 0, gpu_write_logged_ = 0;
 };
 
 }  // namespace x2w_startup
