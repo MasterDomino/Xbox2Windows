@@ -2095,7 +2095,14 @@ class Stage:
     # reads its src0_sel/src1_sel field, zero-extended or, under sext(), sign-extended, and the
     # compare then reads that 32-bit value as its type. A binary32 class compare reads the whole
     # float in SRC0 and selects an integer field in SRC1 for the mask.
-    def compare_sdwa_sources(self, base, typ, ops, mods, *, float_src0=False):
+    #
+    # An f32 source (#1906) with a DWORD selection reads the register as binary32 with neg/abs as in
+    # the e64 form. A BYTE or WORD selection is refused: LLVM's SIPeepholeSDWA models it as the field
+    # zero-extended and read as binary32 bits (the RDNA 2 ISA guide gives SDWAB only its fields), so
+    # the field is always +0 or a denormal and the result depends on the binary32 denormal mode, which
+    # this translator does not read (pixel_aot refuses the same forms). sext() is valid for integer
+    # operands only (LLVM AMDGPUModifierSyntax; LLVM 15 does not decode the bit on a float source).
+    def compare_sdwa_sources(self, base, typ, ops, mods, *, float_src0=False, float_sources=False):
         fields = {}
         for m in mods:
             key, _, value = m.partition(':')
@@ -2111,6 +2118,15 @@ class Stage:
             if float_src0 and index == 0:
                 if selection != 'DWORD' or sext:
                     raise Unsupported('%s requires a DWORD float source' % base)
+                sources.append(self.f(token))
+                continue
+            if float_sources:
+                if 'sext(' in token:
+                    raise Unsupported('%s: sext() on a float source' % base)
+                if selection != 'DWORD':
+                    raise Unsupported('%s: f32 SDWA byte/word selection depends on the binary32 denormal mode'
+                                      % base)
+                # The whole word: the same text as the e64 form with the same modifiers.
                 sources.append(self.f(token))
                 continue
             if sext:
@@ -2222,10 +2238,6 @@ class Stage:
         # Conditions outside the table or dedicated lowering stay refused in both forms.
         if cond not in table:
             raise Unsupported(base)
-        if sdwa and typ == 'f32':
-            # The f32 predicates are verified on the plain and e64 forms only (#1920); the SDWA forms
-            # stay refused until they are verified too.
-            raise Unsupported('%s: f32 SDWA compares are not lowered' % base)
         if sdwa:
             self.check_compare_sdwa_destination(base, writes_exec, ops)
         if len(ops) == 3:
@@ -2233,7 +2245,8 @@ class Stage:
         else:
             dst, (a, b) = ('exec' if writes_exec else 'vcc'), ops
         if sdwa:
-            x, y = self.compare_sdwa_sources(base, typ, [a, b], mods)
+            # f32 sources: DWORD selections only, read as in the e64 form, so {2} tests the registers.
+            x, y = self.compare_sdwa_sources(base, typ, [a, b], mods, float_sources=typ == 'f32')
         elif typ == 'f32':
             x, y = self.f(a), self.f(b)
         elif typ == 'i32':

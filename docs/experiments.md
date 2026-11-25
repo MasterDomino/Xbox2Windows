@@ -6502,8 +6502,9 @@ Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_opsel$' -V`.
 **VOPC SDWA compares (#1906).** `compare()` refused every `v_cmp*_sdwa` and `v_cmpx*_sdwa`. It now lowers the
 SDWA forms of its 32-bit table. An i32 or u32 source reads its `src0_sel`/`src1_sel` field through `sdwa_source`,
 sign-extended under `sext()`, and the compare reads that 32-bit value as its type. Binary32 class compares read
-a DWORD float from SRC0 and select the integer class mask from SRC1. Ordinary f32 predicates stay refused
-in their SDWA form until their NaN behavior is verified (#1920). The
+a DWORD float from SRC0 and select the integer class mask from SRC1. Ordinary f32 predicates were refused in
+their SDWA form until their NaN behavior was verified (#1920); DWORD selections are now lowered (f32 SDWA entry
+below). The
 destination is `vcc_lo`, the SGPR the decoder prints, or EXEC for `v_cmpx` with the same EXEC masking as before.
 A sub-dword class value, a missing or repeated select and unsupported SDWA modifiers are refused.
 `startup_gfx2hlsl_vopc_sdwa` evaluates the emitted class predicate for 42 forms across all ten binary32 classes,
@@ -6541,7 +6542,8 @@ fixtures matched); FXC on both backends and DXC on WARP gave the ordered result.
 `startup_gfx2hlsl_f32_lg` decodes every f32 condition of the table (v_cmp and v_cmpx, e32 and e64 under every
 neg/abs combination, 510 forms), translates it and evaluates the HLSL over all 256 pairs of +-0, +-min denormal,
 +-1.0, +-max finite, +-inf, +-quiet, signalling and payload NaN against a reference built from the ISA
-definitions on the bit patterns; the old `!=` text fails all 68 lg/nlg forms, and the f32 SDWA forms stay refused.
+definitions on the bit patterns; the old `!=` text fails all 68 lg/nlg forms. The f32 SDWA lg/nlg forms with DWORD
+selections must emit the e64 text (see the f32 SDWA entry below).
 The draws `startup_gfx2hlsl_f32_lg_{warp,hardware}` build one of those words from the pixel's x and one from its
 y, so 16 x 16 pixels cover every pair, and write `v_cmp_lg_f32_e32`, `v_cmp_nlg_f32_e64`, `v_cmp_lg_f32_e64` and
 `v_cmp_nlg_f32_e32` results or keep a pixel through `v_cmpx_lg/nlg_f32_e32/e64`, compiled with FXC `ps_5_1` and
@@ -6573,6 +6575,34 @@ is recorded, and it matched. Also recorded, not checked: with `/Gis` and `-Gis` 
 both matched every pixel. Run `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_f32_nan' -V`;
 `tests/startup_gfx2hlsl_f32_nan_check.py binary <llvm-mc>` and `decode <libLLVM>` round-trip the fixtures through
 LLVM 15.
+
+**f32 SDWA compares (#1906).** `compare()` refused every `v_cmp_*_f32_sdwa` and `v_cmpx_*_f32_sdwa` until the f32
+predicates were exact on NaN (#1930, #1949). DWORD selections are now lowered: they read the register as binary32
+with neg/abs as in the e64 form, so a `src0_sel:DWORD src1_sel:DWORD` compare emits the e64 text of the same
+modifiers, NaN bit test included. Byte and word selections are refused
+(`<name>: f32 SDWA byte/word selection depends on the binary32 denormal mode`), because the selected field is always
++0 or a denormal and its result depends on the denormal mode, which gfx2hlsl does not read. `tools/pixel_aot.py`
+refuses the same forms. `sext()` is integer-only (LLVM's `AMDGPUModifierSyntax`) and refused; LLVM 15 does not
+decode the bit on a float source. LLVM's `SIPeepholeSDWA` models the sub-dword case as zero-extension read as
+binary32 bits; the RDNA 2 ISA guide gives only the SDWAB fields (§13.3.8) and says VOPC SDWA has no OMOD, CLMP,
+DST_U or DST_SEL (§6.8). `startup_gfx2hlsl_f32_sdwa` builds and decodes every f32 SDWA form: 15 conditions; v_cmp
+into `vcc_lo` and into an SGPR, v_cmpx into EXEC; 7 x 7 selects; 4 x 4 neg/abs. Each of the 720 DWORD/DWORD forms
+must emit the e64 text, and its HLSL is evaluated over the 256 source pairs of the lg check under the IEEE, FXC and
+DXC models of the nan check (184,320 evaluations) against the ISA reference. Each of the 34,560 forms with a byte or
+word select on either source must be refused with that message. The text before #1930/#1949 on the same operands
+fails all 128 guarded forms under the model of the compiler that broke it. The draws
+`startup_gfx2hlsl_f32_sdwa_{warp,hardware}` write four DWORD/DWORD results of each condition (`(a, b)`,
+`(-a, |b|)`, `(-|a|, -b)`, `(|a|, b)`, into `vcc_lo` and SGPRs) and keep pixels through
+`v_cmpx_<cond>_f32_sdwa -v3, |v4| src0_sel:DWORD src1_sel:DWORD`, 30 fixtures compiled with default-flag FXC
+`ps_5_1` and DXC `ps_6_0`. Every pixel matched on WARP and the RX 9070 XT with both compilers (denormal sources
+flushed where they matter). The text before #1930/#1949 fails each draw on the compiler that broke it (lg/nlg on
+both) and matches that compiler's model. The exception is o and u under DXC: their old text keeps each source's
+modifiers, and DXC folded `x == x` for `(a, b)` and `(-a, |b|)` in `cmp_o`/`cmp_u` but not for `(-|a|, -b)` or
+`(|a|, b)`. In `cmpx_o`/`cmpx_u`, DXC folded the `|b|` side but not the `-a` side. Those matches are recorded, as
+are the old text on the other compiler and `/Gis`/`-Gis` runs (every fixture matched). Run
+`ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_f32_sdwa' -V`;
+`tests/startup_gfx2hlsl_f32_sdwa_check.py binary <llvm-mc>` and `decode <libLLVM>` round-trip all 35,280 forms
+(lowered and refused) and the fixtures through LLVM 15. Class compares are unchanged.
 
 **Four half channels in a typed buffer load.** `BUF_FMT_16_16_16_16_FLOAT` stores x and y in the first
 dword and z and w in the second, and the typed-load format table had only the two-channel half-float
