@@ -1389,6 +1389,25 @@ These are measured on one executable; treat them as hypotheses for others.
   before the gate opens and must read B back from A's copy. The fixture does not cover
   refusal after a normal Close or any command-buffer interaction. Run
   `ctest --preset release --no-tests=error -R '^startup_upload_lifetime_' -V`.
+- **Slot 148 acceptance client.** This client tests the upload allocation that the title's
+  acceleration-structure builder requests (#1758). It drives the stand-in's actual list and
+  queue, uses whichever slot 148 the build installs, and keeps no upload page of its own.
+  - **Request:** the traced shape, `(list, 0x280, 0x10)`, returning a pointer.
+  - **Held submissions:** A is submitted behind a gate fence. The list is Reset with another
+    allocator, and B is written and submitted. While both are held, an observer queue on the
+    same desktop device copies both GPU ranges. After the gate opens, A must read A and B must
+    read B, byte for byte. Both payloads come from the lifetime fixture above.
+  - **Other cases:** a Reset on A's own allocator after that allocator's Reset, the overwrite
+    control, and an early-reuse control on an unsubmitted list. It also checks refusal after a
+    successful Close and invalid arguments.
+  - **GPU addresses:** the client reads them through the fixture export
+    `x2w_d3d12_upload_gpu_address(list, cpu, bytes)`, taken from the module that implements the
+    slot.
+  - **Current result:** slot 148 is a no-op, so the client prints `slot 148 not implemented`
+    (exit 10) and CTest reports a skip. Once the slot returns memory, the full acceptance runs
+    without any change to the registration.
+  - **Run:** `cmake --build --preset release --target startup_slot148_acceptance` and
+    `ctest --preset release --no-tests=error -R '^startup_slot148_acceptance_' -V`.
 - **Inline samplers.** Pixel shaders build sampler descriptors from constants (`s_movk_i32`,
   `s_bfm_b32`, 64-bit moves); the translator folds those into static samplers. A source-built
   pixel stage checks all four manifest words, rejects a mask width from a root constant, and
