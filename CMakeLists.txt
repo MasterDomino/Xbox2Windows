@@ -2590,8 +2590,10 @@ endforeach()
 # XMem pages and a private range: the default, real sharing, forced copying, host sharing refusal, a
 # copy without a submit fence (the default backing is kept and the refusal reported), a refresh that
 # cannot be staged (the submission runs, the buffer is reported stale) and a one-buffer staging pool
-# (a waiting refresh must not block release(), the info export or another queue). The copy path also
-# refreshes on COMPUTE and COPY queues. Each mutant removes one guarantee in the DLL and must fail its case.
+# (a waiting refresh must not block release(), the info export or another queue). Refreshes run on an
+# internal copy queue; the copy path also reads on COMPUTE and COPY queues, reads one buffer on two
+# queues after one CPU write (both must see it), and follows a title-owned cross-queue fence without
+# deadlock. Each mutant removes one guarantee in the DLL and must fail its case.
 add_executable(linear_buffer_backing_check tests/linear_buffer_backing_check.cpp)
 target_include_directories(linear_buffer_backing_check PRIVATE tests)
 target_compile_features(linear_buffer_backing_check PRIVATE cxx_std_17)
@@ -2603,7 +2605,7 @@ foreach(adapter IN ITEMS warp hardware)
     endforeach()
 endforeach()
 foreach(control IN ITEMS copy:skip_refresh copy:reuse_early copy:copy_gpu_writes refusal:ignore_feature
-        copy:refusal_silent contention:hold_lock)
+        copy:refusal_silent contention:hold_lock copy:skip_consumer_wait)
     string(REPLACE ":" ";" parts "${control}")
     list(GET parts 0 path)
     list(GET parts 1 mutant)

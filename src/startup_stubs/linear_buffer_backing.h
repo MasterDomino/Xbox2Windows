@@ -31,12 +31,30 @@
 // decided without a D3D12 call.
 //
 // Copy. A committed default-heap buffer whose bytes are refreshed from the title memory at each
-// submission through the command-queue wrapper, before the title's lists execute on that queue,
-// never at bind or record. Only the bytes that differ from the last upload are copied, through an
-// upload staging buffer. A staging buffer is reused only after the queue fence of the submission
-// that read it has completed. The default buffer itself is rewritten in queue order, after every
-// earlier submission on that queue; a title write to bytes that an incomplete submission still reads
-// is an unsynchronized concurrent write, outside the contract.
+// submission through a command-queue wrapper, before the title's lists execute, never at bind or
+// record. Only the bytes that differ from the last upload are copied, through an upload staging
+// buffer.
+//
+// Every refresh runs on one internal COPY queue per device, which never waits on a title fence. A
+// refresh's copy (staging -> backing) is executed there and signals an internal fence value; the
+// buffer remembers the value of its last refresh. Every submission through a queue wrapper, on any
+// queue type, first makes that queue Wait for the highest such value among the live copied buffers
+// (when it has not completed yet). A consumer on any queue therefore runs after every refresh that
+// was enqueued before it, wherever that refresh came from, so the bytes recorded as uploaded at
+// enqueue are the bytes the consumer reads. No title queue ever waits on another title queue: a
+// refresh never sits behind the title's own waits, so title-owned cross-queue fences (queue 1 waits
+// on a fence queue 2 signals after its lists) cannot form a cycle with it.
+//
+// The internal queue may write a backing while an earlier submission that reads it is still waiting
+// on its queue. Buffers allow simultaneous access from several queues, so this is valid D3D12, and
+// it matches unified memory on the console: a read that executes later sees the CPU's latest writes.
+// A title write to bytes that an executing submission is reading at that moment is an
+// unsynchronized concurrent write, outside the contract, here as on the console.
+//
+// A staging buffer is reused only after the internal fence value of the copy that read it has
+// completed (title fences do not matter: only that copy reads it). If the internal queue or its fence
+// cannot be created, the copy cannot order its consumers: placements keep the default backing and
+// record the refusal (below).
 //
 // Where neither path can keep its guarantees, slot 133 keeps the default backing and returns what it
 // returns without this switch. A title on the console does not see CreatePlacedResourceX fail, so a
@@ -47,8 +65,8 @@
 //   - a GPU-written use (ALLOW_UNORDERED_ACCESS) that cannot be shared: the copy has no point at which
 //     GPU writes reach the title memory. refusal_hr is the sharing HRESULT, or DXGI_ERROR_UNSUPPORTED
 //     when sharing was not attempted (X2W_D3D12_LINEAR_BUFFERS=copy).
-//   - no submit fence (X2W_TEST_SUBMIT_FENCE_FAIL=1, or the fence cannot be created): staging reuse
-//     cannot wait for completion. E_NOT_VALID_STATE.
+//   - no internal refresh queue or fence (X2W_TEST_SUBMIT_FENCE_FAIL=1 gives E_NOT_VALID_STATE, else
+//     the HRESULT of creating them): consumers could not be ordered behind refreshes.
 //   - the copy's default buffer cannot be created: that HRESULT.
 //
 // At submit nothing is refused: holding back a submission can leave a title waiting on its fences.
@@ -68,6 +86,8 @@
 //     ignore-feature   sharing is attempted although the feature query reports no support
 //     refusal-silent   a kept default backing is not reported (no log text, info or totals)
 //     hold-lock        the wait for a full staging pool keeps mutex_ held (other callers block)
+//     skip-consumer-wait  submissions do not Wait for the internal fence (consumers race refreshes)
+//   x2w_d3d12_linear_buffer_internal_queue  returns the internal queue, so a fixture can hold refreshes
 //   X2W_TEST_LINEAR_STAGING_LIMIT=<n>      the staging pool holds n buffers instead of 256
 //   X2W_TEST_LINEAR_REFRESH_FAIL=<n>       staging requests 2, 2 + n, 2 + 2n, ... fail with E_OUTOFMEMORY
 
@@ -214,8 +234,9 @@ public:
             ++totals_.shared;
         } else if (uav && !linear_detail::mutant("copy-gpu-writes")) {
             hr = record.info.share_hr == S_FALSE ? DXGI_ERROR_UNSUPPORTED : record.info.share_hr;
-        } else if (linear_detail::submit_fence_forced_off() || FAILED(fence_check(device))) {
-            hr = E_NOT_VALID_STATE;
+        } else if (const HRESULT internal = linear_detail::submit_fence_forced_off() ? E_NOT_VALID_STATE : internal_ready(device);
+                   FAILED(internal)) {
+            hr = internal;
         } else {
             const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
             const auto desc = linear_detail::buffer(width, uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
@@ -305,21 +326,17 @@ public:
         std::vector<unsigned char>().swap(found->second.copy->uploaded);
     }
 
-    // What one submission used: released by the queue fence value that after_submit signals.
-    struct Submission {
-        std::vector<Staging*> staging;
-        RefreshList* list = nullptr;
-    };
-
-    // Before the title's lists are executed on queue (the contract's copy point): records and
-    // executes the refresh of every live copied buffer whose title bytes changed. Nothing here holds
-    // the submission back: a buffer whose refresh fails keeps its last upload and is marked stale.
+    // Before the title's lists are executed on queue (the contract's copy point): refreshes every live
+    // copied buffer whose title bytes changed, on the internal queue, then makes queue wait for every
+    // refresh of a live copied buffer that has not landed yet. Nothing here holds the submission back:
+    // a buffer whose refresh fails keeps its last upload and is marked stale.
     //
     // mutex_ is held only to read and publish state: the work is snapshotted under it, then staging
     // is taken (and, with the pool full, its fence waited for), filled, recorded and executed without
     // it, and the results are published under it again. A release() or another queue's submission
-    // therefore never waits behind a fence wait or ExecuteCommandLists here.
-    void before_submit(ID3D12CommandQueue* queue, Submission& submission)
+    // therefore never waits behind a fence wait or ExecuteCommandLists here. internal_mutex_ only
+    // keeps the internal queue's ExecuteCommandLists and Signal in fence-value order.
+    void before_submit(ID3D12CommandQueue* queue)
     {
         struct Work {
             ID3D12Resource* dest;
@@ -330,15 +347,12 @@ public:
             HRESULT hr = S_OK;
         };
         std::vector<Work> work;
-        QueueState* state = nullptr;
-        HRESULT state_hr = S_OK;
         {
             std::lock_guard lock(mutex_);
             ++totals_.submissions;
             bool any = false;
             for (auto& [resource, record] : records_) any |= record.copy && record.copy->live;
-            if (!any) return;
-            state_hr = queue_state(queue, &state);
+            if (!any || !internal_queue_) return;
             for (auto& [resource, record] : records_) {
                 const std::shared_ptr<Copied>& copy = record.copy;
                 if (!copy || !copy->live) continue;
@@ -369,96 +383,34 @@ public:
                 }
             }
         }
-        if (work.empty()) return;
+        if (!work.empty()) refresh(work);
 
-        // Without the lock: staging (each one ours alone once taken), the copy into it, the list, the queue.
-        std::vector<Staging*> taken;
-        bool any_staged = false;
-        for (Work& w : work) {
-            w.hr = state_hr;
-            if (SUCCEEDED(w.hr)) w.hr = acquire_staging(queue, w.bytes, taken, &w.staging);
-            if (FAILED(w.hr)) continue;
-            taken.push_back(w.staging);
-            std::memcpy(w.staging->mapped, w.source + w.offset, static_cast<std::size_t>(w.bytes));
-            any_staged = true;
+        // Order this submission behind every refresh of a live copied buffer that may not have landed.
+        UINT64 wait_for = 0;
+        {
+            std::lock_guard lock(mutex_);
+            for (auto& [resource, record] : records_)
+                if (record.copy && record.copy->live && record.copy->refresh_value > wait_for) wait_for = record.copy->refresh_value;
+            if (wait_for && internal_fence_->GetCompletedValue() < wait_for && !linear_detail::mutant("skip-consumer-wait"))
+                ++totals_.consumer_waits;
+            else
+                wait_for = 0;
         }
-        RefreshList* list = nullptr;
-        HRESULT list_hr = S_OK;
-        if (any_staged) {
-            list_hr = acquire_list(queue, *state, &list);
-            if (SUCCEEDED(list_hr)) {
-                // Buffers rest in COMMON: each copy promotes its destination to COPY_DEST (on a direct,
-                // compute or copy queue alike), and it decays to COMMON again when this
-                // ExecuteCommandLists completes, before the title's lists use it.
-                for (const Work& w : work)
-                    if (SUCCEEDED(w.hr)) list->list->CopyBufferRegion(w.dest, w.offset, w.staging->buffer, 0, w.bytes);
-                list_hr = list->list->Close();
-            }
-            if (SUCCEEDED(list_hr)) {
-                ID3D12CommandList* lists[] = {list->list};
-                queue->ExecuteCommandLists(1, lists);
-            }
+        if (wait_for) {
+            const HRESULT hr = queue->Wait(internal_fence_, wait_for);
+            if (FAILED(hr) && x2w_local::first_calls(wait_logged_, 4))
+                x2w_local::logf("x2w-d3d12 linear buffers: queue %p could not wait for refresh 0x%llx (0x%08lx)",
+                                static_cast<void*>(queue), static_cast<unsigned long long>(wait_for), static_cast<unsigned long>(hr));
         }
-
-        // Publish under the lock. Two submissions that snapshot the same buffer concurrently can both
-        // copy the same changed span and publish `uploaded` in either order, so `uploaded` may briefly
-        // lag what the GPU already holds. The next submission then compares the title against an older
-        // upload and copies a span that is redundant or larger than needed, never one that misses a
-        // change, so the cost is an extra refresh, not stale data.
-        std::lock_guard lock(mutex_);
-        if (list && FAILED(list_hr)) list->value = 0;
-        for (Work& w : work) {
-            const HRESULT hr = FAILED(w.hr) ? w.hr : list_hr;
-            if (FAILED(hr)) {
-                if (w.staging) w.staging->value = 0;  // never reached the GPU
-                refresh_failed(w.dest, *w.copy, hr);
-                continue;
-            }
-            submission.staging.push_back(w.staging);
-            Copied& copy = *w.copy;
-            if (copy.live) {
-                // The backing now holds these bytes (the staging buffer keeps them until its fence).
-                try {
-                    if (copy.uploaded.size() != copy.bytes) copy.uploaded.assign(static_cast<std::size_t>(copy.bytes), 0);
-                    std::memcpy(copy.uploaded.data() + w.offset, w.staging->mapped, static_cast<std::size_t>(w.bytes));
-                } catch (const std::bad_alloc&) {
-                    copy.uploaded.clear();  // the next submission copies the whole buffer again
-                }
-            }
-            copy.stale = false;
-            ++copy.refreshes;
-            copy.bytes_copied += w.bytes;
-            copy.last_staging = w.staging->id;
-            ++totals_.refreshes;
-            totals_.bytes_copied += w.bytes;
-        }
-        if (SUCCEEDED(list_hr) && list) submission.list = list;
     }
 
-    // After the title's lists were executed on queue: the fence value that completes them also releases
-    // the staging buffers and refresh list used for this submission.
-    void after_submit(ID3D12CommandQueue* queue, Submission& submission)
+    // The internal queue, AddRef'd, for fixtures that hold refreshes in flight; null before the first
+    // copied placement.
+    ID3D12CommandQueue* internal_queue()
     {
         std::lock_guard lock(mutex_);
-        const auto found = queues_.find(queue);
-        if (found == queues_.end()) return;
-        QueueState& state = found->second;
-        UINT64 value = 0;
-        if (SUCCEEDED(queue->Signal(state.fence, state.value + 1))) value = ++state.value;
-        // Without a signalled value nothing used here can be proven complete: it stays in use.
-        for (Staging* staging : submission.staging) {
-            staging->fence = state.fence;
-            staging->value = value ? value : ~UINT64{0};
-        }
-        if (submission.list) submission.list->value = value ? value : ~UINT64{0};
-        submission = {};
-        if (!value) {
-            if (x2w_local::first_calls(signal_logged_, 2))
-                x2w_local::logf("x2w-d3d12 linear buffers: the submit fence could not be signalled; its staging stays in use");
-            return;
-        }
-        for (auto& [resource, record] : records_)
-            if (record.copy && record.copy->live) record.copy->last_fence = value;
+        if (internal_queue_) internal_queue_->AddRef();
+        return internal_queue_;
     }
 
     bool info(ID3D12Resource* resource, X2wLinearBufferInfo* out)
@@ -471,7 +423,7 @@ public:
             out->refreshes = copy->refreshes;
             out->bytes_copied = copy->bytes_copied;
             out->last_staging = copy->last_staging;
-            out->last_fence = copy->last_fence;
+            out->last_fence = copy->refresh_value;
             out->stale = copy->stale ? 1 : 0;
             out->refresh_failures = copy->refresh_failures;
             out->last_refresh_hr = copy->last_refresh_hr;
@@ -492,7 +444,8 @@ private:
         bool live = true;
         std::vector<unsigned char> uploaded;  // what the backing holds (empty before the first refresh)
         std::vector<unsigned char> bound;     // skip-refresh mutant: the bytes at placement
-        UINT64 refreshes = 0, bytes_copied = 0, last_staging = 0, last_fence = 0, refresh_failures = 0;
+        UINT64 refreshes = 0, bytes_copied = 0, last_staging = 0, refresh_failures = 0;
+        UINT64 refresh_value = 0;  // internal fence value of the last enqueued refresh
         bool stale = false;
         HRESULT last_refresh_hr = S_OK;
     };
@@ -504,18 +457,13 @@ private:
         ID3D12Resource* buffer = nullptr;
         unsigned char* mapped = nullptr;
         UINT64 bytes = 0, id = 0;
-        ID3D12Fence* fence = nullptr;  // the queue fence whose value completes its last use
+        ID3D12Fence* fence = nullptr;  // the internal fence, whose value completes the copy that read it
         UINT64 value = 0;              // 0: free; ~0: in use with no signalled value
     };
     struct RefreshList {
         ID3D12CommandAllocator* allocator = nullptr;
         ID3D12GraphicsCommandList* list = nullptr;
         UINT64 value = 0;
-    };
-    struct QueueState {
-        ID3D12Fence* fence = nullptr;
-        UINT64 value = 0;
-        std::vector<std::unique_ptr<RefreshList>> lists;
     };
     struct Heap {
         void* base;
@@ -592,39 +540,103 @@ private:
         return hr;
     }
 
-    // Whether a fence can be created for this device at all (the copy path's lifetime guarantee needs one).
-    HRESULT fence_check(ID3D12Device* device)
+    // The internal refresh queue and its fence, created once (under mutex_, from place()).
+    HRESULT internal_ready(ID3D12Device* device)
     {
-        if (fence_check_device_ != device) {
-            fence_check_device_ = device;
-            ID3D12Fence* fence = nullptr;
-            fence_check_hr_ = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
-            if (fence) fence->Release();
+        if (internal_queue_) return S_OK;
+        if (internal_tried_) return internal_hr_;
+        internal_tried_ = true;
+        const D3D12_COMMAND_QUEUE_DESC desc{D3D12_COMMAND_LIST_TYPE_COPY};
+        ID3D12CommandQueue* queue = nullptr;
+        ID3D12Fence* fence = nullptr;
+        internal_hr_ = device->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue));
+        if (SUCCEEDED(internal_hr_)) internal_hr_ = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+        if (FAILED(internal_hr_)) {
+            if (queue) queue->Release();
+            x2w_local::logf("x2w-d3d12 linear buffers: the internal refresh queue could not be created (0x%08lx); copied "
+                            "buffers keep the default backing", static_cast<unsigned long>(internal_hr_));
+            return internal_hr_;
         }
-        return fence_check_hr_;
+        queue->SetName(L"x2w linear-buffer refresh");
+        internal_device_ = device;
+        internal_queue_ = queue;
+        internal_fence_ = fence;
+        return S_OK;
     }
 
-    HRESULT queue_state(ID3D12CommandQueue* queue, QueueState** out)
+    // Staging, the refresh list and the internal queue, without mutex_; then publish under it.
+    template <class Work>
+    void refresh(std::vector<Work>& work)
     {
-        auto found = queues_.find(queue);
-        if (found == queues_.end()) {
-            if (linear_detail::submit_fence_forced_off()) return E_NOT_VALID_STATE;
-            ID3D12Device* device = nullptr;
-            HRESULT hr = queue->GetDevice(IID_PPV_ARGS(&device));
-            ID3D12Fence* fence = nullptr;
-            if (SUCCEEDED(hr)) hr = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
-            if (device) device->Release();
-            if (FAILED(hr)) return hr;
-            try {
-                found = queues_.emplace(queue, QueueState{}).first;
-            } catch (const std::bad_alloc&) {
-                fence->Release();
-                return E_OUTOFMEMORY;
-            }
-            found->second.fence = fence;
+        std::vector<Staging*> taken;
+        bool any_staged = false;
+        for (Work& w : work) {
+            w.hr = acquire_staging(w.bytes, taken, &w.staging);
+            if (FAILED(w.hr)) continue;
+            taken.push_back(w.staging);
+            std::memcpy(w.staging->mapped, w.source + w.offset, static_cast<std::size_t>(w.bytes));
+            any_staged = true;
         }
-        *out = &found->second;
-        return S_OK;
+        RefreshList* list = nullptr;
+        HRESULT list_hr = S_OK;
+        bool executed = false;
+        UINT64 value = 0;
+        if (any_staged) {
+            list_hr = acquire_list(&list);
+            if (SUCCEEDED(list_hr)) {
+                // Buffers rest in COMMON: each copy promotes its destination to COPY_DEST on the internal
+                // queue, and it decays to COMMON again when this ExecuteCommandLists completes.
+                for (const Work& w : work)
+                    if (SUCCEEDED(w.hr)) list->list->CopyBufferRegion(w.dest, w.offset, w.staging->buffer, 0, w.bytes);
+                list_hr = list->list->Close();
+            }
+            if (SUCCEEDED(list_hr)) {
+                std::lock_guard submit(internal_mutex_);
+                ID3D12CommandList* lists[] = {list->list};
+                internal_queue_->ExecuteCommandLists(1, lists);
+                executed = true;
+                list_hr = internal_queue_->Signal(internal_fence_, internal_value_ + 1);
+                if (SUCCEEDED(list_hr)) value = ++internal_value_;
+            }
+        }
+
+        // Publish under the lock. Two submissions that snapshot the same buffer concurrently can both
+        // copy the same changed span and publish `uploaded` in either order, so `uploaded` may briefly
+        // lag what the GPU already holds. The next submission then compares the title against an older
+        // upload and copies a span that is redundant or larger than needed, never one that misses a
+        // change, so the cost is an extra refresh, not stale data. Every consumer waits for the higher
+        // of the two fence values.
+        std::lock_guard lock(mutex_);
+        // Executed without a fence value: what it read can never be proven free, so it stays in use.
+        const UINT64 held = executed ? ~UINT64{0} : 0;
+        if (list) list->value = value ? value : (FAILED(list_hr) ? held : value);
+        for (Work& w : work) {
+            const HRESULT hr = FAILED(w.hr) ? w.hr : list_hr;
+            if (FAILED(hr)) {
+                if (w.staging) w.staging->value = held;
+                refresh_failed(w.dest, *w.copy, hr);
+                continue;
+            }
+            w.staging->fence = internal_fence_;
+            w.staging->value = value;
+            Copied& copy = *w.copy;
+            if (value > copy.refresh_value) copy.refresh_value = value;
+            if (copy.live) {
+                // The backing holds these bytes once `value` completes; every consumer waits for it.
+                try {
+                    if (copy.uploaded.size() != copy.bytes) copy.uploaded.assign(static_cast<std::size_t>(copy.bytes), 0);
+                    std::memcpy(copy.uploaded.data() + w.offset, w.staging->mapped, static_cast<std::size_t>(w.bytes));
+                } catch (const std::bad_alloc&) {
+                    copy.uploaded.clear();  // the next submission copies the whole buffer again
+                }
+            }
+            copy.stale = false;
+            ++copy.refreshes;
+            copy.bytes_copied += w.bytes;
+            copy.last_staging = w.staging->id;
+            ++totals_.refreshes;
+            totals_.bytes_copied += w.bytes;
+        }
     }
 
     static bool complete(const Staging& staging)
@@ -636,7 +648,7 @@ private:
     // Takes a staging buffer of at least `bytes` that no submission still reads, for this submission
     // alone (`taken` are the ones it already holds). Called without mutex_: the lock is taken only to
     // choose or publish a buffer; creating one and waiting for a fence happen outside it.
-    HRESULT acquire_staging(ID3D12CommandQueue* queue, UINT64 bytes, const std::vector<Staging*>& taken, Staging** out)
+    HRESULT acquire_staging(UINT64 bytes, const std::vector<Staging*>& taken, Staging** out)
     {
         const bool early = linear_detail::mutant("reuse-early");
         {
@@ -679,7 +691,7 @@ private:
                     }
                 }
             }
-            if (create) return create_staging(queue, bytes, out);
+            if (create) return create_staging(bytes, out);
             if (!fence || attempt) break;
             // The hold-lock mutant waits with mutex_ held, as before the review: other callers block.
             std::unique_lock<std::mutex> held;
@@ -694,21 +706,16 @@ private:
     }
 
     // Called without mutex_ after acquire_staging reserved a place in the pool (creating_).
-    HRESULT create_staging(ID3D12CommandQueue* queue, UINT64 bytes, Staging** out)
+    HRESULT create_staging(UINT64 bytes, Staging** out)
     {
         auto staging = std::make_unique<Staging>();
-        ID3D12Device* device = nullptr;
-        HRESULT hr = queue->GetDevice(IID_PPV_ARGS(&device));
-        if (SUCCEEDED(hr)) {
-            const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_UPLOAD};
-            const UINT64 rounded = (bytes + 0xFFFF) & ~UINT64{0xFFFF};
-            const UINT64 size = rounded ? rounded : 0x10000;
-            const auto desc = linear_detail::buffer(size, D3D12_RESOURCE_FLAG_NONE);
-            hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                                                 IID_PPV_ARGS(&staging->buffer));
-            device->Release();
-            staging->bytes = size;
-        }
+        const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_UPLOAD};
+        const UINT64 rounded = (bytes + 0xFFFF) & ~UINT64{0xFFFF};
+        const UINT64 size = rounded ? rounded : 0x10000;
+        const auto desc = linear_detail::buffer(size, D3D12_RESOURCE_FLAG_NONE);
+        HRESULT hr = internal_device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                                               nullptr, IID_PPV_ARGS(&staging->buffer));
+        staging->bytes = size;
         void* mapped = nullptr;
         const D3D12_RANGE none{0, 0};
         if (SUCCEEDED(hr)) hr = staging->buffer->Map(0, &none, &mapped);
@@ -731,15 +738,15 @@ private:
         return S_OK;
     }
 
-    // A refresh list for queue whose last use has completed, or a new one, reset and ours alone.
-    // Called without mutex_; the lock covers only the choice and the pool.
-    HRESULT acquire_list(ID3D12CommandQueue* queue, QueueState& state, RefreshList** out)
+    // A refresh list for the internal queue whose last use has completed, or a new one, reset and ours
+    // alone. Called without mutex_; the lock covers only the choice and the pool.
+    HRESULT acquire_list(RefreshList** out)
     {
         RefreshList* found = nullptr;
         {
             std::lock_guard lock(mutex_);
-            const UINT64 completed = state.fence->GetCompletedValue();
-            for (const auto& list : state.lists) {
+            const UINT64 completed = internal_fence_->GetCompletedValue();
+            for (const auto& list : internal_lists_) {
                 if (list->value == ~UINT64{0} || list->value > completed) continue;
                 list->value = ~UINT64{0};
                 found = list.get();
@@ -752,15 +759,11 @@ private:
             *out = found;  // on failure the caller frees it again under the lock
             return hr;
         }
-        ID3D12Device* device = nullptr;
-        HRESULT hr = queue->GetDevice(IID_PPV_ARGS(&device));
-        if (FAILED(hr)) return hr;
-        const D3D12_COMMAND_LIST_TYPE type = queue->GetDesc().Type;
         auto list = std::make_unique<RefreshList>();
-        hr = device->CreateCommandAllocator(type, IID_PPV_ARGS(&list->allocator));
+        HRESULT hr = internal_device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY, IID_PPV_ARGS(&list->allocator));
         if (SUCCEEDED(hr))
-            hr = device->CreateCommandList(0, type, list->allocator, nullptr, IID_PPV_ARGS(&list->list));
-        device->Release();
+            hr = internal_device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, list->allocator, nullptr,
+                                                     IID_PPV_ARGS(&list->list));
         if (FAILED(hr)) {
             if (list->list) list->list->Release();
             if (list->allocator) list->allocator->Release();
@@ -769,11 +772,11 @@ private:
         list->value = ~UINT64{0};
         std::lock_guard lock(mutex_);
         try {
-            state.lists.push_back(std::move(list));
+            internal_lists_.push_back(std::move(list));
         } catch (const std::bad_alloc&) {
             return E_OUTOFMEMORY;
         }
-        *out = state.lists.back().get();
+        *out = internal_lists_.back().get();
         return S_OK;
     }
 
@@ -792,17 +795,22 @@ private:
 
     std::mutex mutex_;
     std::unordered_map<ID3D12Resource*, Record> records_;
-    std::unordered_map<ID3D12CommandQueue*, QueueState> queues_;
+    std::mutex internal_mutex_;  // the internal queue's ExecuteCommandLists and Signal, in value order
+    ID3D12Device* internal_device_ = nullptr;
+    ID3D12CommandQueue* internal_queue_ = nullptr;
+    ID3D12Fence* internal_fence_ = nullptr;
+    UINT64 internal_value_ = 0;  // under internal_mutex_
+    bool internal_tried_ = false;
+    HRESULT internal_hr_ = S_OK;
+    std::vector<std::unique_ptr<RefreshList>> internal_lists_;
     std::vector<std::unique_ptr<Staging>> staging_;
     std::vector<Heap> heaps_;
     ID3D12Device* feature_device_ = nullptr;
     HRESULT feature_hr_ = S_FALSE;
-    ID3D12Device* fence_check_device_ = nullptr;
-    HRESULT fence_check_hr_ = S_OK;
     UINT64 generation_ = 0, staging_ids_ = 0, staging_requests_ = 0;
     std::size_t creating_ = 0;  // staging buffers being created outside the lock
     X2wLinearBufferTotals totals_{};
-    volatile LONG unreadable_logged_ = 0, signal_logged_ = 0, refresh_logged_ = 0;
+    volatile LONG unreadable_logged_ = 0, wait_logged_ = 0, refresh_logged_ = 0;
 };
 
 }  // namespace x2w_startup

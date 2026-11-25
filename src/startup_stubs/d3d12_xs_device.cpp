@@ -1576,6 +1576,14 @@ extern "C" __declspec(dllexport) void x2w_d3d12_linear_buffer_totals(X2wLinearBu
     *totals = X2wLinearBufferTotals{};
     if (x2w_startup::linear_buffer_mode() != x2w_startup::LinearBufferMode::off) linear_buffers().totals(totals);
 }
+// Fixtures: the internal queue that runs every refresh (AddRef'd), so a fixture can hold refreshes in
+// flight behind a fence of its own. False before the first copied placement.
+extern "C" __declspec(dllexport) bool x2w_d3d12_linear_buffer_internal_queue(void** queue)
+{
+    if (!queue) return false;
+    *queue = x2w_startup::linear_buffer_mode() == x2w_startup::LinearBufferMode::off ? nullptr : linear_buffers().internal_queue();
+    return *queue != nullptr;
+}
 
 // Fixtures: the number of desktop allocators a title allocator stands for (0 if it has none yet).
 extern "C" __declspec(dllexport) unsigned x2w_d3d12_allocator_pool_size(void* allocator)
@@ -3511,18 +3519,12 @@ bool console_layout_srv(const D3D12_RESOURCE_DESC& desc);
 #include "startup_stubs/d3d12_compute_binding_trace.inl"
 #include "startup_stubs/list_copy_texture.inl"
 
-// X2W_D3D12_LINEAR_BUFFERS: the copied linear buffers are refreshed from title memory on the queue
-// just before the title's lists. A refresh that fails leaves that buffer stale (logged, counted);
-// the lists run either way.
-void linear_refresh(ID3D12CommandQueue* queue, x2w_startup::LinearBuffers::Submission& submission)
+// X2W_D3D12_LINEAR_BUFFERS: the copied linear buffers are refreshed from title memory on the internal
+// refresh queue, and queue waits for those refreshes, just before the title's lists. A refresh that
+// fails leaves that buffer stale (logged, counted); the lists run either way.
+void linear_refresh(ID3D12CommandQueue* queue)
 {
-    if (x2w_startup::linear_buffer_mode() != x2w_startup::LinearBufferMode::off)
-        linear_buffers().before_submit(queue, submission);
-}
-void linear_submitted(ID3D12CommandQueue* queue, x2w_startup::LinearBuffers::Submission& submission)
-{
-    if (x2w_startup::linear_buffer_mode() != x2w_startup::LinearBufferMode::off)
-        linear_buffers().after_submit(queue, submission);
+    if (x2w_startup::linear_buffer_mode() != x2w_startup::LinearBufferMode::off) linear_buffers().before_submit(queue);
 }
 
 // Queue slot 10, desktop ExecuteCommandLists(count, lists).
@@ -3531,7 +3533,6 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
     X2W_ZONE("ExecuteCommandLists");
     static LONG calls;
     drain_retired_resources();
-    x2w_startup::LinearBuffers::Submission linear;
     if (render_mode()) {
         // A closed list stays submittable until its next Reset, as on the desktop.
         std::vector<ID3D12CommandList*> ready;
@@ -3539,7 +3540,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
         auto* queue = static_cast<ID3D12CommandQueue*>(self->own().real);
         // Before the wrapper's locks: a refresh may wait for a staging fence, and recording must not
         // wait with it.
-        if (count) linear_refresh(queue, linear);
+        if (count) linear_refresh(queue);
         // Pin the closed recording and its allocator through submission bookkeeping.
         AcquireSRWLockExclusive(&draw_lock);
         AcquireSRWLockExclusive(&allocator_lock);
@@ -3587,8 +3588,6 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
         } else if (!ready.empty()) {
             submit(ready, submitted);
         }
-        // Also when no list was ready: an executed refresh still needs its fence value.
-        linear_submitted(queue, linear);
         ReleaseSRWLockExclusive(&allocator_lock);
         ReleaseSRWLockExclusive(&draw_lock);
         check_device("CommandQueue execute", 35);
@@ -3602,9 +3601,8 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
     std::vector<ID3D12CommandList*> real(count);
     for (UINT i = 0; i < count; ++i) real[i] = reinterpret_cast<ID3D12CommandList*>(unwrap(reinterpret_cast<u64>(lists[i])));
     auto* queue = static_cast<ID3D12CommandQueue*>(self->own().real);
-    linear_refresh(queue, linear);
+    linear_refresh(queue);
     queue->ExecuteCommandLists(count, real.data());
-    linear_submitted(queue, linear);
     if (first_calls(calls)) log("x2w-d3d12 CommandQueue::ExecuteCommandLists count=%u", count);
 }
 
