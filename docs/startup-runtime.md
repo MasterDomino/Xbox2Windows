@@ -204,10 +204,14 @@ The translation is refused when:
 - either header has another size;
 - the code reads an attribute the table does not list.
 
-The shader cache revision is `x2w-startup-shader-15`. Older translations evaluate `s_brev_b32` of a
-constant at run time instead of folding it into a known word, which changes the emitted HLSL.
+The shader cache revision is `x2w-startup-shader-17`. Earlier translations lower `v_med3_f32` through a
+branchless median, which returns the smaller of the other two operands when a source is NaN. The matching
+compute (`x2w-startup-shader-17cs`) and fixed slot 57 mesh (`x2w-startup-mesh-57-2`) keys advance
+because those stages use the shared lowering.
+Revisions before 16 lower `v_fract_f32` through a bare `frac` instead of the clamped `fract32` helper.
 Revisions before 15 lower `v_cvt_pk_u8_f32` with a float clamp and accept `s_setreg_imm32_b32` writes of the
 rounding mode.
+Revisions before 14 evaluate constant `s_brev_b32` at run time instead of folding it into a known word.
 Revisions before 12 can overwrite the source mask when a save-EXEC instruction uses the
 same source and destination register.
 Earlier revisions can also carry a stale scalar symbol across a join, read a stale SCC after
@@ -655,7 +659,14 @@ code that names the export (see `src/startup_stubs/trap.h`).
 ## Run
 
 Prepare a folder with the executable and its package DLLs yourself. Never commit or upload it.
-Then:
+Alternatively, stage one executable and its adjacent DLLs with:
+
+```powershell
+.\tools\startup\stage_package.ps1 -PackageDir <package root> -Exe <title>.exe -RunDir <fresh run folder>
+```
+
+The destination must be absent or empty and separate from the package. Archives and subdirectories
+are not copied. Keep using the package root as `-DataDir`, then run the staged executable:
 
 ```powershell
 .\tools\startup\run.ps1 -Exe <folder>\<title>.exe -DataDir <package root> -LogDir out\startup\run1 `
@@ -1336,6 +1347,8 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_D3D12_QUERY_SLOTS=1` | diagnostic, in render mode: binds command-list slots 28 to 30 to the hypothesised occlusion query methods (see [Occlusion queries](#occlusion-queries)). Unset, the three slots stay no-ops |
 | `X2W_D3D12_BUDGET=1` | adds [video memory budget and allocation counts](#d3d12-resource-budget) to the D3D12 heartbeat |
 | `X2W_D3D12_RELEASE_RETIRED=1` | opt-in, effective with `X2W_D3D12_RENDER=1` only (the list handlers that record holds exist only there): frees the desktop object of a released committed 2D texture of one narrow class once no recorded list, submission or release-time fence refers to it ([details](#d3d12-resource-budget)). Unset, nothing changes |
+| `X2W_D3D12_RELEASE_RETIRED_VIEWS=1` | opt-in, effective only together with `X2W_D3D12_RELEASE_RETIRED=1`: a released class texture that only tracked slot-18 descriptor slots keep alive (the title never overwrites them) is freed once those slots are replaced by null descriptors ([details](#d3d12-resource-budget)). Unset, nothing changes |
+| `X2W_D3D12_RETIRE_REASONS=1` | diagnostic only, effective with `X2W_D3D12_RELEASE_RETIRED=1` and `X2W_D3D12_BUDGET=1`: adds one `x2w-retire held:` line to the heartbeat that counts final-released resources whose desktop object is still alive, by reason ([details](#d3d12-resource-budget)). Unset, nothing is recorded |
 | `X2W_DRAW_NULL_IDENTITY=1` | null descriptors read as identity values instead of zero |
 | `X2W_DEPTH_STATE=1` | translated draws of slot 57 pipelines take their depth-stencil state and stencil reference from state block A instead of the desktop default (depth and stencil off); a refused block keeps the default. Off by default, then nothing changes: see [Shortcuts that are known to be wrong](#shortcuts-that-are-known-to-be-wrong) |
 | `X2W_PRESENT_SIGNATURE_EVERY=<n>` | in render mode, samples a coarse signature of the presented picture every `n` presents from the start, without a script request (`0` off). Unset, sampling starts, every 4 presents, only once a script with a `wait` asks for it: see [Waiting for the presented picture](#waiting-for-the-presented-picture) |
@@ -1410,6 +1423,47 @@ unordered-access flag, and live in a default heap without heap flags:
   `written_textures` entries whose generation has not changed are cleared so
   reusing the same title address or desktop pointer does not skip uploads or
   resolve a retired wrapper.
+
+`X2W_D3D12_RELEASE_RETIRED_VIEWS=1` (only with `X2W_D3D12_RELEASE_RETIRED=1`) ends the
+`view-refs` retention. Once a released class texture's release-time fences have passed,
+the drain (a try-lock, never blocking) replaces every tracked slot-18 descriptor slot
+that names it, in every heap and so every `CopyDescriptors*` copy, by a null SRV of the
+same dimension: the shadow entry and its ref are dropped, the desktop descriptor is
+rewritten with `CreateShaderResourceView(nullptr, ...)`, the view records naming the
+resource lose it, and the view token in title descriptor memory is cleared when it
+still carries that id. A draw that reads the slot afterwards binds a null texture
+(zeros). The texture is then freed by the normal rules: lists and submissions that hold
+it through `retire_hold` keep the desktop object until the recording is dropped or the
+submission's fence passes. No recorded list or submission reads a title heap's SRV
+descriptor (translated draws build their own descriptors from the tokens at draw time
+and hold what they sample), so the rewrite cannot reach GPU work. A slot that cannot be
+rewritten keeps its ref and the texture stays retained. Not covered: a title thread
+that writes the same slot at the moment of the drain, and a guest that uses the
+resource after its final release (unsupported with the switch, as before).
+`startup_resource_retire_views_*` reads the desktop descriptors back through a compute
+probe; the `keep` and `noretire` cases are the negative controls.
+
+`X2W_D3D12_RETIRE_REASONS=1` (with `X2W_D3D12_RELEASE_RETIRED=1` and
+`X2W_D3D12_BUDGET=1`) adds a diagnostic line to the heartbeat. It counts every
+resource whose final guest Release happened and whose desktop object is still
+alive, once, by the first cause that applies. Format: `reason=count/bytes(oldest Nf)`,
+bytes from the budget ticket, `oldest` in frames since the final Release:
+- `view-refs`: a tracked slot 18 descriptor still names it;
+  `view-refs-in-visible-heap` is the part with a descriptor in a shader-visible heap.
+- `list-hold`, `flight`: a closed or recording list, or a submission, holds a
+  desktop reference.
+- `queued-waiting-fence`: queued, the release-time fence of a queue has not passed;
+  `drain-pending`: ready, the drain has not run yet; `unqueued`: no queue could take its marker.
+- `left-class:<view|view-copy|residency|present|hold-missed>`: it was in the class and the first use named left it.
+- `never-class:<buffer|dimension|msaa|rt-ds-uav|heap-type|heap-flags|title-memory|aliased|reserved|slot>`: it was
+  never in the class (`slot`: created by a path that does not classify).
+- `other`: none of the above.
+`total` is the sum; `unattributed` is the budget's retained count and bytes minus
+`total` (backing heaps, upload and readback objects, and anything created outside the wrappers).
+Wrappers without a desktop object (tiled address textures) are not counted. A
+released resource that only a list or submission keeps alive after its wrapper
+let go is matched by its desktop pointer. Without the switches nothing is
+recorded and no line is built.
 
 Every other resource (buffers, placed buffers, reserved resources, render/depth/UAV
 targets, and slot 127 `__XMemAllocationHooks__` textures) keeps the lifetime
@@ -1939,7 +1993,7 @@ These are measured on one executable; treat them as hypotheses for others.
   lane's exec bit, and the manifest becomes version 2 with a
   `uav <index> tex2d table <table> <offset>` line. The cache-policy bits are accepted. A partial
   channel mask (a typed store writes all four channels), other dimensions, `d16`, `a16`, `tfe`,
-  `lwe`, `r128`, `unorm`, `image_store_mip`, a store outside a pixel stage, and a program that loads
+  `lwe`, `r128`, `image_store_mip`, a store outside a pixel or compute stage, and a program that loads
   and stores the same image are refused by name. The runtime does not bind UAVs on the translated
   graphics path yet: it logs and does not use a translation whose manifest has a `uav` line. A
   hand-assembled program stores four distinct values at texel (1, 2). The desktop draw reads all 16
@@ -2955,9 +3009,17 @@ descriptions with:
 
 - `D3D12_SRV_DIMENSION_BUFFER` (raw `R32_TYPELESS`, structured `Format == UNKNOWN` with a stride that is a multiple of 4 up to
   2048, or typed buffers). It resolves an existing live placed (slot 133) or committed (slot 127)
-  buffer covering `[address, address + (FirstElement + NumElements) * element_bytes)`, checks
-  alignment and bounds, adjusts `FirstElement` by `(address - base) / element_bytes`, and forwards
-  to `CreateShaderResourceView` (slot 18).
+  buffer covering `[address, address + (FirstElement + NumElements) * element_bytes)`. When no live
+  buffer exists at the address, `unplaced_memory_buffer` backs the unplaced range: it calculates a
+  64 KiB page-aligned extent via `unplaced_buffer_extent`, verifies committed pages through
+  `measure_placed_buffer`, and avoids placed alias conflicts (`placed_buffer_range`). It reuses
+  cached unplaced buffers per device matching the base allocation when `unplaced_buffer_covers` is true,
+  re-checking committed status to handle title memory deallocation/reallocation. On adapters supporting
+  `D3D12_FEATURE_EXISTING_HEAPS` for `MEM_PRIVATE` memory, it opens the existing heap and creates a
+  zero-copy placed resource alias; otherwise (or on WARP), it falls back to a committed upload buffer and
+  synchronizes memory from the host. When the device wrapper is released (`refs == 0`),
+  `clear_unplaced_buffers` safely cleans up cached entries. Once resolved, it checks alignment and bounds,
+  adjusts `FirstElement` by `(address - base) / element_bytes`, and forwards to `CreateShaderResourceView` (slot 18).
 
 Acceleration-structure views (`D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE`,
 `src/startup_stubs/memory_srv_as.h`) take their address from the view's `Location`, or from the call's
@@ -2983,9 +3045,10 @@ Checks:
 `startup_memory_srv_buffer` is device-free and owns every rejection (bounds, alignment, format,
 stride). It changes each buffer description and view field alone, checks the element bytes of every
 typed format, views that end exactly at the end of the buffer, raw alignment of the adjusted first
-element, and widths, addresses and first elements above 4 GiB. Its `_control` runs (`height`,
-`exact-fit`, `first-32`) expect wrong answers and must fail. `startup_address_buffer_srv_*` exercises
-only the resolve path with valid addresses on a device, so it does not cover the rejections.
+element, widths, addresses and first elements above 4 GiB, page extent calculation, and cache range
+coverage. Its `_control` runs (`height`, `exact-fit`, `first-32`, `unplaced-extent`, `unplaced-covers`)
+expect wrong answers and must fail. `startup_address_buffer_srv_*` exercises placed and unplaced buffer
+views with valid addresses on a device (WARP and hardware), and verifies the refusal lines.
 
 `startup_memory_srv_volume` is device-free and validates volume (Texture3D) memory SRVs in
 device slot 70 (`supports_volume_memory_srv`, `address_view_fits`, `volume_texture_bytes`).
@@ -3017,6 +3080,8 @@ check only:
   the buffer (includes the destination origin, the source box origin and the footprint-height slice stride),
   block alignment, every multiply and add in the footprint arithmetic checked for wrapping. Block-compressed
   bounds are whole 4x4 blocks, as in D3D12: a 2x2 or 1x1 mip takes the 4x4 footprint GetCopyableFootprints gives it.
+  An explicit box must also end on a block (`{0,0,2,2}` on a 2x2 mip is `bad_alignment`): forwarded, it makes the
+  desktop list's Close fail with E_INVALIDARG.
 - Subresource index: `mip + slice * mips + plane * mips * array_size` must lie inside the resource's
   `mips * array_size * planes`; a mip-only modulo would read an out-of-range slice as mip 0
   (`bad_subresource`). A planar format (more than one plane) is refused (`planar_unsupported`).
@@ -3034,6 +3099,7 @@ check only:
 Wrapped-list readback (`tests/startup_list_copy_texture_warp.cpp`): two images round-trip through array
 slices 1 and 2 of a 2-mip, 3-slice texture (upload buffer, texture, readback buffer, byte-for-byte), and a
 list with an out-of-range subresource, an index of `0xffffffff` and a footprint format mismatch is refused
-before any desktop copy, leaving a sentinel-filled readback buffer unchanged. Reproduce the portable check
-with its negative controls and the WARP and hardware runs with
+before any desktop copy, leaving a sentinel-filled readback buffer unchanged. On a BC1 2x2 mip, the same
+list refuses boxes with an unaligned right or bottom edge, copies the aligned 4x4 block, and reads back
+all eight block bytes with the next byte unchanged. Reproduce the portable and wrapped-list checks with
 `ctest --preset dev --no-tests=error -R '^startup_list_copy_texture' -V`.
