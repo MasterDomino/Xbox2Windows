@@ -81,10 +81,12 @@
 // totals (refresh_failures, last_refresh_hr).
 //
 // A copied buffer that a recorded copy writes (list CopyBufferRegion or CopyResource, list_copy.inl)
-// keeps the GPU's bytes from that recording on: it is no longer refreshed. The title memory never
-// receives those bytes, and a later refresh that spans them would copy the title's older bytes over
-// them. This is what the default backing does for such a buffer; info and totals report it
-// (gpu_written).
+// keeps the GPU's bytes once that recording is submitted: it is no longer refreshed. The title memory
+// never receives those bytes, and a later refresh that spans them would copy the title's older bytes
+// over them. This is what the default backing does for such a buffer; info and totals report it
+// (gpu_written). Until the submission the write is pending on the recording, with the texture writes
+// of list_copy.inl: a Reset or a failed Close drops it, and the buffer stays refreshed. The recording's
+// own submission still refreshes it first (its queue waits for that refresh, then the copy runs).
 //
 // Fixtures only:
 //   X2W_TEST_EXISTING_HEAPS_UNSUPPORTED=1  the feature query reports no support (an adapter such as
@@ -98,6 +100,7 @@
 //     hold-lock        the wait for a full staging pool keeps mutex_ held (other callers block)
 //     skip-consumer-wait  submissions do not Wait for the internal fence (consumers race refreshes)
 //     refresh-gpu-written  a copied buffer that a recorded copy wrote is still refreshed
+//     gpuw-at-record   the buffer stops being refreshed when the copy is recorded, not when it is submitted
 //   x2w_d3d12_linear_buffer_internal_queue  returns the internal queue, so a fixture can hold refreshes
 //   X2W_TEST_LINEAR_STAGING_LIMIT=<n>      the staging pool holds n buffers instead of 256
 //   X2W_TEST_LINEAR_REFRESH_FAIL=<n>       staging requests 2, 2 + n, 2 + 2n, ... fail with E_OUTOFMEMORY
@@ -338,8 +341,9 @@ public:
         }
     }
 
-    // A recorded copy writes the backing of `resource` (list_copy.inl): if it is a copied buffer, it keeps
-    // the GPU's bytes from now on and is no longer refreshed from the title memory.
+    // A submitted recording writes the backing of `resource` (list_copy.inl, after its ExecuteCommandLists):
+    // if it is a copied buffer, it keeps the GPU's bytes from now on and is no longer refreshed from the
+    // title memory.
     void note_gpu_write(ID3D12Resource* resource)
     {
         if (linear_detail::mutant("refresh-gpu-written")) return;
