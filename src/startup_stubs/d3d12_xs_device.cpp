@@ -3526,6 +3526,11 @@ void linear_refresh(ID3D12CommandQueue* queue)
 {
     if (x2w_startup::linear_buffer_mode() != x2w_startup::LinearBufferMode::off) linear_buffers().before_submit(queue);
 }
+// After the title's lists on queue: a later refresh's copy waits for this submission (the producer wait).
+void linear_submitted(ID3D12CommandQueue* queue)
+{
+    if (x2w_startup::linear_buffer_mode() != x2w_startup::LinearBufferMode::off) linear_buffers().after_submit(queue);
+}
 
 // Queue slot 10, desktop ExecuteCommandLists(count, lists).
 void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
@@ -3588,6 +3593,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
         } else if (!ready.empty()) {
             submit(ready, submitted);
         }
+        if (!ready.empty()) linear_submitted(queue);
         ReleaseSRWLockExclusive(&allocator_lock);
         ReleaseSRWLockExclusive(&draw_lock);
         check_device("CommandQueue execute", 35);
@@ -3603,6 +3609,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
     auto* queue = static_cast<ID3D12CommandQueue*>(self->own().real);
     linear_refresh(queue);
     queue->ExecuteCommandLists(count, real.data());
+    if (count) linear_submitted(queue);
     if (first_calls(calls)) log("x2w-d3d12 CommandQueue::ExecuteCommandLists count=%u", count);
 }
 
@@ -3719,6 +3726,9 @@ u64 __stdcall queue_wait(Wrapper* self, u64 rdx, u64 r8, u64 r9)
     if (!fence || fence->own().kind != fence_kind) return queue_dynamic<17>(self, rdx, r8, r9);
     InterlockedExchange(&self->own().queue_wait_seen, 1);
     const HRESULT hr = static_cast<ID3D12CommandQueue*>(self->own().real)->Wait(static_cast<ID3D12Fence*>(fence->own().real), r8);
+    // X2W_D3D12_LINEAR_BUFFERS: a refresh does not wait for a submission behind this wait until it is reached.
+    if (SUCCEEDED(hr) && x2w_startup::linear_buffer_mode() != x2w_startup::LinearBufferMode::off)
+        linear_buffers().note_title_wait(static_cast<ID3D12CommandQueue*>(self->own().real), static_cast<ID3D12Fence*>(fence->own().real), r8);
     static LONG calls;
     if (first_calls(calls, 2))
         log("x2w-d3d12 CommandQueue::slot17(fence=%p, value=0x%llx) -> Wait 0x%08lx", static_cast<void*>(fence), r8,

@@ -73,7 +73,8 @@
 //   contention (contention only) a second queue, a release() and the info export while a submission
 //        waits for the only staging buffer, whose copy the fixture holds on the internal refresh
 //        queue: all three must finish while the wait is still under way. After the refreshes land the
-//        waiting refresh has taken that buffer again (none is created), and both gated reads see C.
+//        waiting refresh has taken that buffer again (none is created). The gated S1 reads B: C's copy
+//        waits for it (the producer wait). S2 reads C.
 //   budget (share, copy) with X2W_D3D12_BUDGET=1: a shared buffer counts as placed memory (its heap
 //        live), a copied one as a committed buffer; live while held, retained after the title's release.
 //   gpuw (copy only) a recorded copy (list slot 15) writes G into a copied buffer, then the title changes
@@ -1251,18 +1252,19 @@ struct Run {
         const auto submit_time = clock::now() - t;
         const bool waiting_after = !done;
         const Tally w_read = tally(gpu.read_output(3).data(), r0 / 4, key);
-        // Let the refreshes land (B, then C), then the gated reads run: both see C, the CPU's last write.
+        // Let B land and the gated reads run. C's copy waits for S1, the earlier submission (the producer
+        // wait): S1 reads B, S2 then reads C, the CPU's last write.
         gpu.open_internal();
         waiter.join();
-        const bool drained = gpu.drain_internal();
         gpu.open_gate();
+        const bool drained = gpu.drain_internal();
         if (!drained || !gpu.wait(s2_value)) return row(pool, "contention", false, "fence timeout after the gates");
         const Tally r1 = tally(gpu.read_output(1).data(), r0 / 4, key), r2 = tally(gpu.read_output(2).data(), r0 / 4, key);
         X2wLinearBufferInfo xi{};
         x2w_d3d12_linear_buffer_info(x_wrapper, &xi);
         const X2wLinearBufferTotals after = totals();
         const bool reused = after.staging_created == before.staging_created && after.staging_reused >= before.staging_reused + 2;
-        const bool pass = waiting_before && waiting_after && probe_done && w_read.count[D] == words && r1.count[C] == words &&
+        const bool pass = waiting_before && waiting_after && probe_done && w_read.count[D] == words && r1.count[B] == words &&
                           r2.count[C] == words && !xi.stale && xi.refresh_failures == 0 && reused &&
                           ms(t1_time) >= ms(info_time + release_time + submit_time);
         char text[400];

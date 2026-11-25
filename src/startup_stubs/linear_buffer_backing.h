@@ -41,15 +41,28 @@
 // queue type, first makes that queue Wait for the highest such value among the live copied buffers
 // (when it has not completed yet). A consumer on any queue therefore runs after every refresh that
 // was enqueued before it, wherever that refresh came from, so the bytes recorded as uploaded at
-// enqueue are the bytes the consumer reads. No title queue ever waits on another title queue: a
-// refresh never sits behind the title's own waits, so title-owned cross-queue fences (queue 1 waits
-// on a fence queue 2 signals after its lists) cannot form a cycle with it.
+// enqueue are the bytes the consumer reads. A submission whose recording writes a copied buffer
+// (gpu_written, below) is ordered behind that buffer's earlier refreshes by the same Wait.
 //
-// The internal queue may write a backing while an earlier submission that reads it is still waiting
-// on its queue. Buffers allow simultaneous access from several queues, so this is valid D3D12, and
-// it matches unified memory on the console: a read that executes later sees the CPU's latest writes.
-// A title write to bytes that an executing submission is reading at that moment is an
-// unsynchronized concurrent write, outside the contract, here as on the console.
+// The refresh is ordered behind earlier GPU access too (the producer wait). Simultaneous access
+// allows concurrent operations on one buffer from several queues only on disjoint ranges, so a copy
+// into a backing must not overlap an earlier submission that still reads or writes it. After the
+// title's lists, each queue wrapper signals a fence of its own (one per desktop queue); before a
+// refresh's copy executes, the internal queue Waits for every such queue's latest value that has not
+// completed (producer_waits in the totals). The wrappers cannot tell which buffers a submission
+// reads (the title binds them by GPU virtual address in root arguments, views and descriptors), so
+// every earlier submission counts as a user of every copied backing: the conservative choice.
+//
+// One exception keeps title fences from closing a cycle through the internal queue. A queue whose
+// latest submission sits behind a title Wait (queue slot 17) on a fence that has not reached its
+// value is not waited for (producer_wait_skips, logged): that fence may be signalled only by a later
+// submission, which itself waits for this refresh (queue 1 waits on a fence that queue 2 signals after
+// its lists, case xq.write), and waiting would deadlock both queues. The skipped submission has not
+// started; it executes after the title's fence and reads the CPU's newer bytes, as unified memory
+// does on the console. Not closed: if that fence is reached while the copy still executes (a CPU
+// Signal, or a Signal that another queue enqueued right behind a submission the refresh waits for),
+// the read may overlap the copy. A title Wait issued on the desktop queue past the wrapper is not
+// seen, and that queue is waited for.
 //
 // A staging buffer is reused only after the internal fence value of the copy that read it has
 // completed (title fences do not matter: only that copy reads it). If the internal queue or its fence
@@ -101,6 +114,7 @@
 //     skip-consumer-wait  submissions do not Wait for the internal fence (consumers race refreshes)
 //     refresh-gpu-written  a copied buffer that a recorded copy wrote is still refreshed
 //     gpuw-at-record   the buffer stops being refreshed when the copy is recorded, not when it is submitted
+//     skip-producer-wait  a refresh does not Wait for earlier submissions (it may overwrite a backing in use)
 //   x2w_d3d12_linear_buffer_internal_queue  returns the internal queue, so a fixture can hold refreshes
 //   X2W_TEST_LINEAR_STAGING_LIMIT=<n>      the staging pool holds n buffers instead of 256
 //   X2W_TEST_LINEAR_REFRESH_FAIL=<n>       staging requests 2, 2 + n, 2 + 2n, ... fail with E_OUTOFMEMORY
@@ -432,10 +446,11 @@ public:
                 }
             }
         }
-        if (!work.empty()) refresh(work);
+        // This submission's own refreshes, including those of a buffer the title released meanwhile.
+        const UINT64 own = work.empty() ? 0 : refresh(work);
 
         // Order this submission behind every refresh of a live copied buffer that may not have landed.
-        UINT64 wait_for = 0;
+        UINT64 wait_for = own;
         {
             std::lock_guard lock(mutex_);
             for (auto& [resource, record] : records_)
@@ -450,6 +465,53 @@ public:
             if (FAILED(hr) && x2w_local::first_calls(wait_logged_, 4))
                 x2w_local::logf("x2w-d3d12 linear buffers: queue %p could not wait for refresh 0x%llx (0x%08lx)",
                                 static_cast<void*>(queue), static_cast<unsigned long long>(wait_for), static_cast<unsigned long>(hr));
+        }
+    }
+
+    // After the title's lists were executed on `queue` (a queue wrapper): signals that queue's user fence,
+    // so a later refresh can be ordered behind this submission (the producer wait). Nothing before the
+    // first copied placement: earlier submissions cannot name a copied backing that did not exist yet.
+    void after_submit(ID3D12CommandQueue* queue)
+    {
+        std::lock_guard lock(mutex_);
+        if (!internal_queue_) return;
+        UserQueue* user = user_queue(queue);
+        if (!user) return;
+        if (!user->fence && !user->untracked) {
+            ID3D12Device* device = nullptr;
+            HRESULT hr = queue->GetDevice(IID_PPV_ARGS(&device));
+            if (SUCCEEDED(hr)) {
+                hr = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&user->fence));
+                device->Release();
+            }
+            if (FAILED(hr)) {
+                user->fence = nullptr;
+                x2w_local::logf("x2w-d3d12 linear buffers: queue %p has no user fence (0x%08lx); refreshes cannot wait for "
+                                "its submissions", static_cast<void*>(queue), static_cast<unsigned long>(hr));
+            }
+        }
+        if (!user->fence || FAILED(queue->Signal(user->fence, user->value + 1))) {
+            user->untracked = true;  // this submission cannot be waited for: refreshes report the queue as skipped
+            return;
+        }
+        user->untracked = false;
+        ++user->value;
+    }
+
+    // The title enqueued Wait(fence, value) on `queue` (queue slot 17, already forwarded). Recorded until the
+    // fence reaches the value: a submission behind it may depend on later work (see the producer wait).
+    void note_title_wait(ID3D12CommandQueue* queue, ID3D12Fence* fence, UINT64 value)
+    {
+        if (!fence || fence->GetCompletedValue() >= value) return;
+        std::lock_guard lock(mutex_);
+        UserQueue* user = user_queue(queue);
+        if (!user) return;
+        prune_waits(*user);
+        try {
+            user->waits.push_back({fence, value, user->value + 1});
+            fence->AddRef();
+        } catch (const std::bad_alloc&) {
+            user->untracked = true;  // not remembered: the queue is not waited for until it submits again
         }
     }
 
@@ -516,6 +578,21 @@ private:
         ID3D12GraphicsCommandList* list = nullptr;
         UINT64 value = 0;
     };
+    // A title Wait (queue slot 17) that had not completed when it was enqueued; `before` is the first user
+    // value it precedes.
+    struct TitleWait {
+        ID3D12Fence* fence;
+        UINT64 value, before;
+    };
+    // A queue wrapper's desktop queue, its user fence (signalled after each submission of the title's
+    // lists) and the title waits it may still sit behind. Kept for the process, as the queues are.
+    struct UserQueue {
+        ID3D12CommandQueue* queue = nullptr;
+        ID3D12Fence* fence = nullptr;
+        UINT64 value = 0;        // the latest submission's user fence value (0: none yet)
+        bool untracked = false;  // the latest submission has no fence value: it cannot be waited for
+        std::vector<TitleWait> waits;
+    };
     struct Heap {
         void* base;
         ID3D12Heap* heap;
@@ -534,6 +611,64 @@ private:
             return parsed ? static_cast<std::size_t>(parsed) : std::size_t{256};
         }();
         return limit;
+    }
+
+    // Under mutex_. The record of `queue`, created on first use; null if it cannot be stored.
+    UserQueue* user_queue(ID3D12CommandQueue* queue)
+    {
+        for (UserQueue& user : users_)
+            if (user.queue == queue) return &user;
+        try {
+            users_.emplace_back();
+        } catch (const std::bad_alloc&) {
+            return nullptr;
+        }
+        users_.back().queue = queue;
+        return &users_.back();
+    }
+    // Under mutex_: forgets the title waits whose fences reached their values.
+    static void prune_waits(UserQueue& user)
+    {
+        auto& waits = user.waits;
+        for (std::size_t i = 0; i < waits.size();) {
+            if (waits[i].fence->GetCompletedValue() >= waits[i].value) {
+                waits[i].fence->Release();
+                waits[i] = waits.back();
+                waits.pop_back();
+            } else {
+                ++i;
+            }
+        }
+    }
+    // Under mutex_: the (user fence, value) of each queue's latest submission that has not completed, which
+    // a refresh's copy waits for. A queue behind an unreached title wait, or one whose latest submission
+    // has no fence value, is skipped and counted (see the producer wait above).
+    std::vector<std::pair<ID3D12Fence*, UINT64>> earlier_users()
+    {
+        std::vector<std::pair<ID3D12Fence*, UINT64>> out;
+        for (UserQueue& user : users_) {
+            prune_waits(user);
+            const bool pending = user.fence && user.value && user.fence->GetCompletedValue() < user.value;
+            if (!pending && !user.untracked) continue;
+            bool blocked = user.untracked;
+            for (const TitleWait& wait : user.waits) blocked |= wait.before <= user.value;
+            if (blocked) {
+                ++totals_.producer_wait_skips;
+                if (x2w_local::first_calls(producer_skip_logged_, 8))
+                    x2w_local::logf("x2w-d3d12 linear buffers: a refresh does not wait for queue %p (%s): its copy may run before "
+                                    "that queue's earlier submission", static_cast<void*>(user.queue),
+                                    user.untracked ? "no user fence value" : "behind a title Wait that has not completed");
+                continue;
+            }
+            if (linear_detail::mutant("skip-producer-wait")) continue;
+            try {
+                out.emplace_back(user.fence, user.value);
+            } catch (const std::bad_alloc&) {
+                continue;
+            }
+            ++totals_.producer_waits;
+        }
+        return out;
     }
 
     HRESULT feature(ID3D12Device* device)
@@ -618,8 +753,9 @@ private:
     }
 
     // Staging, the refresh list and the internal queue, without mutex_; then publish under it.
+    // Returns the internal fence value of the refresh it enqueued (0: none).
     template <class Work>
-    void refresh(std::vector<Work>& work)
+    UINT64 refresh(std::vector<Work>& work)
     {
         std::vector<Staging*> taken;
         bool any_staged = false;
@@ -645,6 +781,18 @@ private:
             }
             if (SUCCEEDED(list_hr)) {
                 std::lock_guard submit(internal_mutex_);
+                // The producer wait: the copy runs after every earlier submission that may use a backing.
+                std::vector<std::pair<ID3D12Fence*, UINT64>> users;
+                {
+                    std::lock_guard lock(mutex_);
+                    users = earlier_users();
+                }
+                for (const auto& [fence, user_value] : users) {
+                    const HRESULT hr = internal_queue_->Wait(fence, user_value);
+                    if (FAILED(hr) && x2w_local::first_calls(wait_logged_, 4))
+                        x2w_local::logf("x2w-d3d12 linear buffers: the refresh queue could not wait for submission 0x%llx (0x%08lx)",
+                                        static_cast<unsigned long long>(user_value), static_cast<unsigned long>(hr));
+                }
                 ID3D12CommandList* lists[] = {list->list};
                 internal_queue_->ExecuteCommandLists(1, lists);
                 executed = true;
@@ -690,6 +838,7 @@ private:
             ++totals_.refreshes;
             totals_.bytes_copied += w.bytes;
         }
+        return value;
     }
 
     static bool complete(const Staging& staging)
@@ -860,12 +1009,13 @@ private:
     std::vector<std::unique_ptr<RefreshList>> internal_lists_;
     std::vector<std::unique_ptr<Staging>> staging_;
     std::vector<Heap> heaps_;
+    std::vector<UserQueue> users_;  // under mutex_
     ID3D12Device* feature_device_ = nullptr;
     HRESULT feature_hr_ = S_FALSE;
     UINT64 generation_ = 0, staging_ids_ = 0, staging_requests_ = 0;
     std::size_t creating_ = 0;  // staging buffers being created outside the lock
     X2wLinearBufferTotals totals_{};
-    volatile LONG unreadable_logged_ = 0, wait_logged_ = 0, refresh_logged_ = 0, gpu_write_logged_ = 0;
+    volatile LONG unreadable_logged_ = 0, wait_logged_ = 0, refresh_logged_ = 0, gpu_write_logged_ = 0, producer_skip_logged_ = 0;
 };
 
 }  // namespace x2w_startup
