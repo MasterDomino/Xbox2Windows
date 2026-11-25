@@ -7,22 +7,27 @@
 #include <cstdint>
 
 struct X2wLinearBufferInfo {
-    std::uint32_t path;             // 1 shared, 2 copied (a refused placement creates no resource)
+    std::uint32_t path;             // 1 shared, 2 copied, 3 kept the default backing (refusal_hr says why)
     std::uint32_t use;              // 1 GPU-read, 2 GPU-written
     std::int32_t feature_hr;        // S_OK supported, DXGI_ERROR_UNSUPPORTED not, other: query failed; S_FALSE not queried
     std::int32_t share_hr;          // result of the sharing attempt; S_FALSE when not attempted
+    std::int32_t refusal_hr;        // kept default: why the new path could not keep its guarantees; else S_OK
+    std::uint32_t stale;            // copied: 1 while the backing holds an older upload than the title's bytes
     std::uint64_t heap_generation;  // shared: generation of the opened heap
     void* backing;                  // the desktop ID3D12Resource
     std::uint64_t refreshes;        // copied: submissions that copied bytes into the backing
     std::uint64_t bytes_copied;     // copied: bytes copied from title memory into the backing
     std::uint64_t last_staging;     // copied: id of the staging buffer of the last refresh (0: none)
     std::uint64_t last_fence;       // copied: queue fence value after the last submission (0: none)
+    std::uint64_t refresh_failures; // copied: submissions that ran without this buffer's refresh
+    std::int32_t last_refresh_hr;   // copied: HRESULT of the last failed refresh; S_OK if none
+    std::int32_t reserved;
 };
 
 struct X2wLinearBufferTotals {
-    std::uint64_t placements, shared, copied, refused;
+    std::uint64_t placements, shared, copied, kept_default;
     std::uint64_t feature_queries, heap_opens, heap_open_failures, heap_cache_hits, place_failures;
     std::uint64_t submissions, refreshes, bytes_copied, staging_created, staging_reused, unreadable;
-    std::uint64_t submissions_refused;
-    std::int32_t last_refusal_hr, last_submit_hr;
+    std::uint64_t refresh_failures;
+    std::int32_t last_refusal_hr, last_refresh_hr;
 };

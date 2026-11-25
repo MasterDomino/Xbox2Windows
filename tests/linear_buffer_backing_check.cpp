@@ -14,7 +14,17 @@
 //   refusal    X2W_D3D12_LINEAR_BUFFERS=1 with X2W_TEST_EXISTING_HEAPS_UNSUPPORTED=1: the host refuses
 //              sharing (as an adapter reporting D3D12_FEATURE_EXISTING_HEAPS = 0 does)
 //   untracked  X2W_D3D12_LINEAR_BUFFERS=copy with X2W_TEST_SUBMIT_FENCE_FAIL=1: no submit fence, so
-//              the copy cannot keep its lifetime guarantee and must refuse
+//              the copy cannot keep its lifetime guarantee: slot 133 keeps the default backing
+//   stale      X2W_D3D12_LINEAR_BUFFERS=copy with X2W_TEST_LINEAR_REFRESH_FAIL=3: staging requests 2,
+//              5, 8 ... fail, so one refresh per pool cannot be staged
+//
+// Where the new path cannot keep its guarantees (a GPU-written use that is not shared, no submit
+// fence), slot 133 must keep the default backing and return what it returns with the switch off:
+// S_OK, an XMem view not aliased, a private range aliased (on an adapter with existing heaps). The
+// refusal must be reported in x2w_d3d12_linear_buffer_info (path 3, refusal_hr), in the totals
+// (kept_default) and in the slot 133 log line ("kept default backing: linear refusal 0x..."), which
+// the fixture reads back from X2W_TRAP_LOG (linear_buffer_backing_<path>_<adapter>.log next to the
+// executable).
 //
 // Title memory comes from two pools. "xmem": xmem.dll physical pages (64 KiB slots of 256 MiB
 // pagefile sections) mapped with X2W_XMEM_SHARED_VIEWS=1, five pages per mapping call (one view):
@@ -27,8 +37,8 @@
 //        before ExecuteCommandLists. The GPU must read B.
 //   a2   then 16 words change to E: the next submission reads them, and a copy moves only those 64 bytes.
 //   b    a GPU-written use (ALLOW_UNORDERED_ACCESS): the GPU writes G ^ key; after the fence the CPU
-//        alias holds it and the words around keep theirs. The copy cannot give this: it must refuse,
-//        with the sharing HRESULT.
+//        alias holds it and the words around keep theirs. The copy cannot give this: slot 133 keeps the
+//        default backing and reports the sharing HRESULT (DXGI_ERROR_UNSUPPORTED when not attempted).
 //   c    a submission is held in flight on a gate fence, then two more (other buffers, C and D). Each
 //        held submission reads its own sentinel. Sharing: the title releases X while it is held, and
 //        after the fence places a new buffer (E) at X's address, on the same cached heap generation.
@@ -39,7 +49,10 @@
 //        (the oracle sees a missing refresh); sharing reads B. Through the wrapper the copy reads B.
 //   d2   readback before the fence: the GPU write of b is held on the gate. Before the gate opens the
 //        fence has not completed and the alias still holds P in every word (the read is ordered
-//        before the write by the queue's Wait); after it, G ^ key. Copying refuses the use (as b).
+//        before the write by the queue's Wait); after it, G ^ key. Copying keeps the default (as b).
+//   stale (stale only) a refreshed submission of A; the CPU writes B and the next refresh fails: the
+//        submission still runs and completes, reads A (the last upload), and the buffer is reported
+//        stale with E_OUTOFMEMORY in info, totals and the log; the next submission reads B and clears it.
 //   split (share only) a buffer across two XMem views: sharing is refused with E_INVALIDARG, decided
 //        before any D3D12 call, and the buffer is copied; case a must still read B.
 //   gate (refusal only) no heap was opened: D3D12_FEATURE_EXISTING_HEAPS gates sharing before any open.
@@ -52,7 +65,7 @@
 //
 // --mutate <name> sets X2W_TEST_LINEAR_BUFFER_MUTANT, which removes one guarantee inside d3d12_xs.dll:
 //   skip-refresh (copy) case a, reuse-early (copy) case c, copy-gpu-writes (copy) case b,
-//   ignore-feature (refusal) case gate.
+//   ignore-feature (refusal) case gate, refusal-silent (copy) case b (the kept default is not reported).
 // The run then exits 1 only if every targeted case failed, else 0 (negative controls, WILL_FAIL).
 // X2W_TEST_DEBUG_LAYER=1 enables the D3D12 debug layer; any stored error fails the run.
 // Returns 0 on pass, 1 on failure, 77 without the adapter, or on the share path when the adapter
@@ -190,7 +203,36 @@ cbuffer Key : register(b0) { uint key; };
 void main(uint3 id : SV_DispatchThreadID) { dst.Store(id.x * 4, src.Load(id.x * 4) ^ key); }
 )";
 
-enum class Path { default_backing, share, copy, refusal, untracked };
+// The X2W_TRAP_LOG file d3d12_xs.dll appends its log lines to; a line with both needles.
+std::wstring log_path;
+bool log_has(const std::string& first, const std::string& second)
+{
+    HANDLE file = CreateFileW(log_path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    std::string text;
+    char chunk[65536];
+    DWORD got = 0;
+    while (ReadFile(file, chunk, sizeof(chunk), &got, nullptr) && got) text.append(chunk, got);
+    CloseHandle(file);
+    std::size_t at = 0;
+    while (at < text.size()) {
+        std::size_t end = text.find('\n', at);
+        if (end == std::string::npos) end = text.size();
+        const std::string line = text.substr(at, end - at);
+        if (line.find(first) != std::string::npos && line.find(second) != std::string::npos) return true;
+        at = end + 1;
+    }
+    return false;
+}
+std::string pointer_text(const void* p)
+{
+    char text[32];
+    std::snprintf(text, sizeof(text), "%p", p);
+    return text;
+}
+
+enum class Path { default_backing, share, copy, refusal, untracked, stale };
 const char* path_name(Path p)
 {
     switch (p) {
@@ -198,7 +240,8 @@ const char* path_name(Path p)
     case Path::share: return "share";
     case Path::copy: return "copy";
     case Path::refusal: return "refusal";
-    default: return "untracked";
+    case Path::untracked: return "untracked";
+    default: return "stale";
     }
 }
 
@@ -462,6 +505,7 @@ struct TitleList {
 
 struct Placed {
     HRESULT hr = E_FAIL;
+    const void* address = nullptr;
     ComPtr<IUnknown> wrapper;
     ComPtr<ID3D12Resource> backing;
     X2wLinearBufferInfo info{};
@@ -471,6 +515,7 @@ struct Placed {
 Placed place(Gpu& gpu, std::uint8_t* address, bool gpu_written)
 {
     Placed p;
+    p.address = address;
     using Place = HRESULT(WINAPI*)(IUnknown*, void*, const D3D12_RESOURCE_DESC*, UINT, const void*, REFIID, void**);
     const auto desc = buffer_desc(buffer_bytes, gpu_written ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE);
     auto* slot = reinterpret_cast<Place>((*reinterpret_cast<void***>(gpu.guest.Get()))[133]);
@@ -492,7 +537,10 @@ std::string backing_text(const Placed& p)
     if (FAILED(p.hr)) return "refused " + hex(p.hr);
     if (!p.linear) return "default";
     char text[160];
-    if (p.info.path == 1)
+    if (p.info.path == 3)
+        std::snprintf(text, sizeof(text), "kept default backing (refusal %s, share %s, feature %s)", hex(p.info.refusal_hr).c_str(),
+                      hex(p.info.share_hr).c_str(), hex(p.info.feature_hr).c_str());
+    else if (p.info.path == 1)
         std::snprintf(text, sizeof(text), "shared (heap generation %llu, feature %s)",
                       static_cast<unsigned long long>(p.info.heap_generation), hex(p.info.feature_hr).c_str());
     else
@@ -515,7 +563,8 @@ X2wLinearBufferTotals totals()
 struct Run {
     Gpu& gpu;
     Path path;
-    unsigned failures = 0, skips = 0;
+    bool adapter_heaps;  // the adapter's own D3D12_FEATURE_EXISTING_HEAPS: the default aliases private ranges
+    unsigned failures = 0, skips = 0, kept_rows = 0;
     std::vector<std::pair<std::string, bool>> results;  // case name -> passed (for --mutate)
 
     bool copying() const { return path == Path::copy || path == Path::refusal; }
@@ -525,6 +574,21 @@ struct Run {
     HRESULT share_refusal(const Pool& pool) const
     {
         return path == Path::refusal ? DXGI_ERROR_UNSUPPORTED : path == Path::share && pool.xmem ? HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED) : S_FALSE;
+    }
+    // The default backing aliases this pool: a private range on an adapter with existing heaps.
+    bool default_aliases(const Pool& pool) const { return !pool.xmem && adapter_heaps; }
+    // A refusal that kept the default backing: slot 133 returned S_OK with an object, and info and the
+    // slot 133 log line carry the refusal HRESULT.
+    bool kept_ok(const Placed& p, HRESULT want, std::string& text)
+    {
+        char needle[64];
+        std::snprintf(needle, sizeof(needle), "kept default backing: linear refusal 0x%08lx", static_cast<unsigned long>(want));
+        const bool logged = log_has("address=" + pointer_text(p.address), needle);
+        const bool ok = SUCCEEDED(p.hr) && p.wrapper && p.linear && p.info.path == 3 && p.info.refusal_hr == want && logged;
+        text += std::string("; refusal ") + (p.linear ? hex(p.info.refusal_hr) : std::string("NOT IN INFO")) + " (expected " + hex(want) +
+                "), log line " + (logged ? "present" : "MISSING");
+        ++kept_rows;
+        return ok;
     }
     void row(const Pool& pool, const char* name, bool pass, const std::string& text)
     {
@@ -544,13 +608,13 @@ struct Run {
         case Path::copy: return SUCCEEDED(p.hr) && p.linear && p.info.path == 2 && p.info.share_hr == S_FALSE;
         case Path::refusal: return SUCCEEDED(p.hr) && p.linear && p.info.path == 2 && p.info.share_hr == DXGI_ERROR_UNSUPPORTED &&
                                    p.info.feature_hr == DXGI_ERROR_UNSUPPORTED;
-        default: return p.hr == E_NOT_VALID_STATE;
+        default: return false;  // untracked: kept_ok decides
         }
     }
-    // What the GPU must read in case a: B, except on the default path over an XMem view (not aliased, zero).
+    // What the GPU must read in case a: B, except where the default backing does not alias (zero).
     bool read_ok(const Pool& pool, const Tally& t, Tag want) const
     {
-        if (path == Path::default_backing && pool.xmem) return t.zero == words;
+        if ((path == Path::default_backing || path == Path::untracked) && !default_aliases(pool)) return t.zero == words;
         return t.count[want] == words;
     }
 
@@ -560,10 +624,6 @@ struct Run {
         Memory memory;
         if (!(split ? pool.allocate_split(memory, A) : pool.allocate(memory, A))) return row(pool, name, false, "allocation failed");
         Placed p = place(gpu, memory.buffer(), false);
-        if (path == Path::untracked) {
-            return row(pool, name, p.hr == E_NOT_VALID_STATE && !p.wrapper,
-                       "slot 133 -> " + hex(p.hr) + " (expected E_NOT_VALID_STATE 0x8007139f: no submit fence to guard staging reuse)");
-        }
         TitleList list;
         if (FAILED(p.hr) || !p.backing || !list.begin(gpu)) return row(pool, name, false, "slot 133 -> " + hex(p.hr));
         list.read(p.backing.Get());
@@ -572,12 +632,16 @@ struct Run {
         if (!gpu.wait(list.submit())) return row(pool, name, false, "fence timeout");
         const Tally t = tally(gpu.read_output().data(), r0 / 4, key);
         refresh_info(p);
-        const bool pass = backing_ok(pool, p, split) && read_ok(pool, t, B) &&
-                          (!p.linear || p.info.path != 2 || p.info.bytes_copied == buffer_bytes);
         std::string text = "slot 133 -> " + hex(p.hr) + ", " + backing_text(p) + "; GPU read " + t.text();
-        if (path == Path::default_backing) text += pool.xmem ? " (old behaviour: not aliased, no copy)" : " (old behaviour: aliased)";
+        bool pass = read_ok(pool, t, B) && (!p.linear || p.info.path != 2 || p.info.bytes_copied == buffer_bytes);
+        if (path == Path::untracked)
+            pass &= kept_ok(p, E_NOT_VALID_STATE, text);  // no submit fence to guard staging reuse
+        else
+            pass &= backing_ok(pool, p, split);
+        if (path == Path::default_backing || path == Path::untracked)
+            text += default_aliases(pool) ? " (old behaviour: aliased)" : " (old behaviour: not aliased, no copy)";
         row(pool, name, pass, text);
-        if (split || !pass || path == Path::default_backing) return;
+        if (split || !pass || path == Path::default_backing || path == Path::untracked) return;
 
         // a2: 16 words change; only they are copied.
         TitleList second;
@@ -603,16 +667,12 @@ struct Run {
         write(memory.buffer(), r1, P, words);
         Placed p = place(gpu, memory.buffer(), true);
         const auto* alias = reinterpret_cast<const std::uint32_t*>(memory.buffer() + r1);
-        const bool copy_refuses = copied(pool) || path == Path::untracked;
-        if (copy_refuses && FAILED(p.hr)) {
-            // The copy has no point at which a GPU write reaches the title memory: refused, no object. The
-            // refusal carries the sharing HRESULT (the feature gate's DXGI_ERROR_UNSUPPORTED, or
-            // ERROR_NOT_SUPPORTED for an XMem view), or DXGI_ERROR_UNSUPPORTED when sharing is not
-            // attempted (copy, untracked).
-            const HRESULT want = share_refusal(pool) == S_FALSE ? DXGI_ERROR_UNSUPPORTED : share_refusal(pool);
-            return row(pool, name, p.hr == want && !p.wrapper,
-                       "GPU-written use: slot 133 -> " + hex(p.hr) + " (expected refusal " + hex(want) + ")");
-        }
+        // The copy has no point at which a GPU write reaches the title memory: slot 133 keeps the default
+        // backing and reports the sharing HRESULT (the feature gate's DXGI_ERROR_UNSUPPORTED, or
+        // ERROR_NOT_SUPPORTED for an XMem view), or DXGI_ERROR_UNSUPPORTED when sharing is not attempted.
+        const bool kept = copied(pool) || path == Path::untracked;
+        const bool on_default = kept || path == Path::default_backing;
+        const HRESULT want = share_refusal(pool) == S_FALSE ? DXGI_ERROR_UNSUPPORTED : share_refusal(pool);
         TitleList list;
         if (FAILED(p.hr) || !p.backing || !list.begin(gpu)) return row(pool, name, false, "slot 133 -> " + hex(p.hr));
         list.write_g(p.backing.Get());
@@ -640,14 +700,13 @@ struct Run {
         bool pass;
         std::string text = "slot 133 -> " + hex(p.hr) + ", " + backing_text(p) + "; " + early + "after the fence alias " +
                            (t.count[G] ? t.text() + " (G ^ key)" : raw.text()) + (around ? ", neighbours kept" : ", NEIGHBOURS CHANGED");
-        if (path == Path::default_backing && pool.xmem) {
-            pass = SUCCEEDED(p.hr) && !p.linear && raw.count[P] == words && around;
-            text += " (old behaviour: not aliased, the alias keeps P)";
-        } else {
-            pass = early_ok && around && t.count[G] == words &&
-                   (path == Path::default_backing ? SUCCEEDED(p.hr) && !p.linear : p.linear && p.info.path == 1);
-            if (path == Path::default_backing) text += " (old behaviour: aliased)";
-        }
+        // Visible: shared, or a default backing that aliases this pool.
+        const bool visible = on_default ? default_aliases(pool) : true;
+        pass = early_ok && around && (visible ? t.count[G] == words : raw.count[P] == words);
+        if (path == Path::default_backing) pass &= SUCCEEDED(p.hr) && !p.linear;
+        else if (kept) pass &= kept_ok(p, want, text);
+        else pass &= p.linear && p.info.path == 1;
+        if (on_default) text += visible ? " (old behaviour: aliased)" : " (old behaviour: not aliased, the alias keeps P)";
         row(pool, name, pass, text);
     }
 
@@ -771,6 +830,47 @@ struct Run {
                     freed ? "freed" : "not freed");
     }
 
+    // stale: a refresh that cannot be staged; the submission still runs, with the last upload.
+    void case_stale(Pool& pool)
+    {
+        Memory memory;
+        if (!pool.allocate(memory, A)) return row(pool, "stale", false, "allocation failed");
+        Placed p = place(gpu, memory.buffer(), false);
+        TitleList first, second, third;
+        if (FAILED(p.hr) || !p.backing || !first.begin(gpu) || !second.begin(gpu) || !third.begin(gpu))
+            return row(pool, "stale", false, "slot 133 -> " + hex(p.hr));
+        first.read(p.backing.Get());
+        first.close();
+        if (!gpu.wait(first.submit())) return row(pool, "stale", false, "fence timeout (first)");
+        const Tally t1 = tally(gpu.read_output().data(), r0 / 4, key);
+        refresh_info(p);
+        const bool fresh1 = p.linear && p.info.path == 2 && !p.info.stale;
+        write(memory.buffer(), r0, B, words);
+        second.read(p.backing.Get());
+        second.close();
+        // The refresh of this submission fails (fixture fault): it must still run and complete.
+        const bool completed = gpu.wait(second.submit());
+        const Tally t2 = tally(gpu.read_output().data(), r0 / 4, key);
+        refresh_info(p);
+        char needle[64];
+        std::snprintf(needle, sizeof(needle), "failed 0x%08lx", static_cast<unsigned long>(E_OUTOFMEMORY));
+        const bool logged = log_has("refresh of " + pointer_text(p.backing.Get()), needle);
+        const bool stale2 = p.info.stale == 1 && p.info.refresh_failures == 1 && p.info.last_refresh_hr == E_OUTOFMEMORY;
+        const unsigned stale_flag = p.info.stale;
+        third.read(p.backing.Get());
+        third.close();
+        if (!gpu.wait(third.submit())) return row(pool, "stale", false, "fence timeout (third)");
+        const Tally t3 = tally(gpu.read_output().data(), r0 / 4, key);
+        refresh_info(p);
+        const bool pass = fresh1 && t1.count[A] == words && completed && t2.count[A] == words && stale2 && logged &&
+                          t3.count[B] == words && !p.info.stale;
+        row(pool, "stale", pass,
+            "refreshed " + t1.text() + "; failed refresh: submission " + (completed ? "completed" : "DID NOT COMPLETE") + ", read " +
+                t2.text() + " (last upload), stale=" + std::to_string(stale_flag) + " " + (stale2 ? "reported" : "NOT REPORTED") +
+                " with " + hex(E_OUTOFMEMORY) + ", log line " + (logged ? "present" : "MISSING") + "; next submission read " + t3.text() +
+                (p.info.stale ? ", STILL STALE" : ", stale cleared"));
+    }
+
     void case_d1(Pool& pool)
     {
         if (path == Path::default_backing || path == Path::untracked) return;
@@ -806,7 +906,7 @@ struct Run {
 int main(int argc, char** argv)
 {
     if (argc < 3) {
-        std::puts("usage: linear_buffer_backing_check <warp|hardware> <default|share|copy|refusal|untracked> [--mutate <name>]");
+        std::puts("usage: linear_buffer_backing_check <warp|hardware> <default|share|copy|refusal|untracked|stale> [--mutate <name>]");
         return 2;
     }
     const bool warp = std::strcmp(argv[1], "warp") == 0;
@@ -818,6 +918,7 @@ int main(int argc, char** argv)
     else if (p == "copy") path = Path::copy;
     else if (p == "refusal") path = Path::refusal;
     else if (p == "untracked") path = Path::untracked;
+    else if (p == "stale") path = Path::stale;
     else return 2;
     std::string mutant;
     if (argc == 5 && std::strcmp(argv[3], "--mutate") == 0) mutant = argv[4];
@@ -829,10 +930,24 @@ int main(int argc, char** argv)
     SetEnvironmentVariableW(L"X2W_D3D12_RENDER", L"1");
     SetEnvironmentVariableW(L"X2W_XMEM_SHARED_VIEWS", L"1");
     SetEnvironmentVariableW(L"X2W_D3D12_LINEAR_BUFFERS", path == Path::default_backing ? nullptr
-                                                         : path == Path::copy || path == Path::untracked ? L"copy" : L"1");
+                                                         : path == Path::copy || path == Path::untracked || path == Path::stale ? L"copy" : L"1");
     SetEnvironmentVariableW(L"X2W_TEST_EXISTING_HEAPS_UNSUPPORTED", path == Path::refusal ? L"1" : nullptr);
     SetEnvironmentVariableW(L"X2W_TEST_SUBMIT_FENCE_FAIL", path == Path::untracked ? L"1" : nullptr);
+    SetEnvironmentVariableW(L"X2W_TEST_LINEAR_REFRESH_FAIL", path == Path::stale ? L"3" : nullptr);
     SetEnvironmentVariableA("X2W_TEST_LINEAR_BUFFER_MUTANT", mutant.empty() ? nullptr : mutant.c_str());
+    {
+        // The DLL's log lines go to linear_buffer_backing_<path>_<adapter>[_<mutant>].log next to this executable.
+        wchar_t module[MAX_PATH]{};
+        const DWORD n = GetModuleFileNameW(nullptr, module, MAX_PATH);
+        if (!n || n >= MAX_PATH) return 1;
+        log_path.assign(module, n);
+        log_path.resize(log_path.find_last_of(L"\\/") + 1);
+        const std::string name = std::string("linear_buffer_backing_") + path_name(path) + "_" + argv[1] +
+                                 (mutant.empty() ? "" : "_" + mutant) + ".log";
+        log_path.append(name.begin(), name.end());
+        DeleteFileW(log_path.c_str());
+        SetEnvironmentVariableW(L"X2W_TRAP_LOG", log_path.c_str());
+    }
 
     char debug_env[4]{};
     const bool debug_layer = GetEnvironmentVariableA("X2W_TEST_DEBUG_LAYER", debug_env, sizeof(debug_env)) && debug_env[0] == '1';
@@ -883,11 +998,15 @@ int main(int argc, char** argv)
         return 77;
     }
 
-    Run run{gpu, path};
+    Run run{gpu, path, SUCCEEDED(heaps_hr) && heaps.Supported != FALSE};
     for (const bool xmem : {true, false}) {
         Pool pool(xmem);
         if (!pool.init()) {
             run.row(pool, "pool", false, "title memory could not be set up");
+            continue;
+        }
+        if (path == Path::stale) {
+            run.case_stale(pool);
             continue;
         }
         run.case_a(pool);
@@ -899,25 +1018,34 @@ int main(int argc, char** argv)
         run.probe_view_pin(pool);
     }
     const X2wLinearBufferTotals t = totals();
-    std::printf("totals: placements %llu (shared %llu, copied %llu, refused %llu), feature queries %llu, heap opens %llu "
+    std::printf("totals: placements %llu (shared %llu, copied %llu, kept default %llu), feature queries %llu, heap opens %llu "
                 "(failed %llu, cache hits %llu), placements failed %llu, submissions %llu, refreshes %llu, bytes copied %llu, "
-                "staging created %llu reused %llu, unreadable %llu, submissions refused %llu, last refusal %s\n",
+                "staging created %llu reused %llu, unreadable %llu, refresh failures %llu, last refusal %s, last refresh failure %s\n",
                 static_cast<unsigned long long>(t.placements), static_cast<unsigned long long>(t.shared),
-                static_cast<unsigned long long>(t.copied), static_cast<unsigned long long>(t.refused),
+                static_cast<unsigned long long>(t.copied), static_cast<unsigned long long>(t.kept_default),
                 static_cast<unsigned long long>(t.feature_queries), static_cast<unsigned long long>(t.heap_opens),
                 static_cast<unsigned long long>(t.heap_open_failures), static_cast<unsigned long long>(t.heap_cache_hits),
                 static_cast<unsigned long long>(t.place_failures), static_cast<unsigned long long>(t.submissions),
                 static_cast<unsigned long long>(t.refreshes), static_cast<unsigned long long>(t.bytes_copied),
                 static_cast<unsigned long long>(t.staging_created), static_cast<unsigned long long>(t.staging_reused),
-                static_cast<unsigned long long>(t.unreadable), static_cast<unsigned long long>(t.submissions_refused),
-                hex(t.last_refusal_hr).c_str());
+                static_cast<unsigned long long>(t.unreadable), static_cast<unsigned long long>(t.refresh_failures),
+                hex(t.last_refusal_hr).c_str(), hex(t.last_refresh_hr).c_str());
     {
         Pool none(false);
         if (path == Path::default_backing) {
             // Opt-in off: no linear-buffer bookkeeping at all.
             const bool untouched = !t.placements && !t.submissions && !t.feature_queries && !t.heap_opens;
             run.row(none, "off", untouched, untouched ? "no linear-buffer code ran (all totals zero)" : "LINEAR-BUFFER CODE RAN");
-        } else if (path == Path::refusal) {
+        } else if (path == Path::stale) {
+            run.row(none, "totals", t.refresh_failures == 2 && t.last_refresh_hr == E_OUTOFMEMORY && t.kept_default == 0,
+                    "refresh failures " + std::to_string(t.refresh_failures) + " (expected 2, one per pool), last " + hex(t.last_refresh_hr));
+        }
+        if (path != Path::default_backing && path != Path::stale) {
+            run.row(none, "kept", t.kept_default == run.kept_rows,
+                    "totals report " + std::to_string(t.kept_default) + " kept default backings for " + std::to_string(run.kept_rows) +
+                        " refused placements, last refusal " + hex(t.last_refusal_hr));
+        }
+        if (path == Path::refusal) {
             run.row(none, "gate", t.feature_queries == 1 && t.heap_opens == 0,
                     "feature queries " + std::to_string(t.feature_queries) + ", heap opens " + std::to_string(t.heap_opens) +
                         " (expected 1 and 0: no open is attempted when D3D12_FEATURE_EXISTING_HEAPS reports no support)");
@@ -936,7 +1064,7 @@ int main(int argc, char** argv)
 
     if (!mutant.empty()) {
         const char* target = mutant == "skip-refresh" ? "a" : mutant == "reuse-early" ? "c" : mutant == "copy-gpu-writes" ? "b"
-                           : mutant == "ignore-feature" ? "gate" : nullptr;
+                           : mutant == "ignore-feature" ? "gate" : mutant == "refusal-silent" ? "b" : nullptr;
         if (!target) return 2;
         unsigned targeted = 0, failed = 0;
         for (const auto& [name, pass] : run.results)

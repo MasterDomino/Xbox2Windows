@@ -3512,11 +3512,12 @@ bool console_layout_srv(const D3D12_RESOURCE_DESC& desc);
 #include "startup_stubs/list_copy_texture.inl"
 
 // X2W_D3D12_LINEAR_BUFFERS: the copied linear buffers are refreshed from title memory on the queue
-// just before the title's lists. False: they could not be (logged), and the lists must not run.
-bool linear_refresh(ID3D12CommandQueue* queue, x2w_startup::LinearBuffers::Submission& submission)
+// just before the title's lists. A refresh that fails leaves that buffer stale (logged, counted);
+// the lists run either way.
+void linear_refresh(ID3D12CommandQueue* queue, x2w_startup::LinearBuffers::Submission& submission)
 {
-    return x2w_startup::linear_buffer_mode() == x2w_startup::LinearBufferMode::off ||
-           SUCCEEDED(linear_buffers().before_submit(queue, submission));
+    if (x2w_startup::linear_buffer_mode() != x2w_startup::LinearBufferMode::off)
+        linear_buffers().before_submit(queue, submission);
 }
 void linear_submitted(ID3D12CommandQueue* queue, x2w_startup::LinearBuffers::Submission& submission)
 {
@@ -3548,7 +3549,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
         bool split = false;
         const auto submit = [&](const auto& native_lists, const auto& wrappers) {
             x2w_startup::LinearBuffers::Submission linear_submission;
-            if (!linear_refresh(queue, linear_submission)) return;
+            linear_refresh(queue, linear_submission);
             const UINT ready_count = static_cast<UINT>(native_lists.size());
             red_producers().execute(queue, native_lists, [&] {
                 if (draw_dump_frame()) {
@@ -3599,7 +3600,7 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
     for (UINT i = 0; i < count; ++i) real[i] = reinterpret_cast<ID3D12CommandList*>(unwrap(reinterpret_cast<u64>(lists[i])));
     auto* queue = static_cast<ID3D12CommandQueue*>(self->own().real);
     x2w_startup::LinearBuffers::Submission linear;
-    if (!linear_refresh(queue, linear)) return;
+    linear_refresh(queue, linear);
     queue->ExecuteCommandLists(count, real.data());
     linear_submitted(queue, linear);
     if (first_calls(calls)) log("x2w-d3d12 CommandQueue::ExecuteCommandLists count=%u", count);
@@ -4345,21 +4346,28 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
     if (initial_state != D3D12_RESOURCE_STATE_COMMON && !(desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
         return E_INVALIDARG;
     const UINT64 offset = static_cast<char*>(address) - static_cast<char*>(base);
+    // X2W_D3D12_LINEAR_BUFFERS=1 or copy: shared or copied at submit (linear_buffer_backing.h). Where
+    // neither keeps its guarantees, the default backing below is kept and the refusal recorded.
+    X2wLinearBufferInfo linear{};
+    char linear_note[160] = "";
     if (x2w_startup::LinearBuffers::eligible(*desc, initial_state)) {
-        // X2W_D3D12_LINEAR_BUFFERS=1 or copy: shared, copied at submit, or refused (linear_buffer_backing.h).
         const bool uav = (sanitized(*desc).Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0;
-        X2wLinearBufferInfo report{};
         ID3D12Resource* resource = nullptr;
         bool shared = false;
-        const HRESULT hr = linear_buffers().place(device_of(self), address, desc->Width, uav, range, &resource, &shared, &report);
-        log("x2w-d3d12 Device::slot133(CreatePlacedResourceX?) linear buffer address=%p base=%p type=0x%lx offset=0x%llx "
-            "width=0x%llx flags=0x%x use=%s existing-heaps=0x%08lx share=0x%08lx -> 0x%08lx %s gpuva=0x%llx", address, base,
-            static_cast<unsigned long>(range.type), offset, desc->Width, desc->Flags, uav ? "gpu-written" : "gpu-read",
-            static_cast<unsigned long>(report.feature_hr), static_cast<unsigned long>(report.share_hr),
-            static_cast<unsigned long>(hr), FAILED(hr) ? "refused" : shared ? "shared" : "copied at submit",
-            resource ? resource->GetGPUVirtualAddress() : 0ull);
-        if (FAILED(hr)) return hr;
-        return publish_placed_buffer(self, address, desc, initial_state, resource, shared, nullptr, out);
+        const HRESULT placed = linear_buffers().place(device_of(self), address, desc->Width, uav, range, &resource, &shared, &linear);
+        if (SUCCEEDED(placed)) {
+            log("x2w-d3d12 Device::slot133(CreatePlacedResourceX?) linear buffer address=%p base=%p type=0x%lx offset=0x%llx "
+                "width=0x%llx flags=0x%x use=%s existing-heaps=0x%08lx share=0x%08lx -> 0x%08lx %s gpuva=0x%llx", address, base,
+                static_cast<unsigned long>(range.type), offset, desc->Width, desc->Flags, uav ? "gpu-written" : "gpu-read",
+                static_cast<unsigned long>(linear.feature_hr), static_cast<unsigned long>(linear.share_hr),
+                static_cast<unsigned long>(placed), shared ? "shared" : "copied at submit", resource->GetGPUVirtualAddress());
+            return publish_placed_buffer(self, address, desc, initial_state, resource, shared, nullptr, out);
+        }
+        if (x2w_startup::LinearBuffers::report_refusals())
+            std::snprintf(linear_note, sizeof(linear_note),
+                          " (kept default backing: linear refusal 0x%08lx, use=%s type=0x%lx existing-heaps=0x%08lx share=0x%08lx)",
+                          static_cast<unsigned long>(placed), uav ? "gpu-written" : "gpu-read", static_cast<unsigned long>(range.type),
+                          static_cast<unsigned long>(linear.feature_hr), static_cast<unsigned long>(linear.share_hr));
     }
     ID3D12Heap* heap = nullptr;
     x2w_budget::Ticket* backing_budget = nullptr;
@@ -4409,9 +4417,10 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
         placement = "not aliased";
     }
     log("x2w-d3d12 Device::slot133(CreatePlacedResourceX?) address=%p base=%p offset=0x%llx width=0x%llx flags=0x%x "
-        "state=0x%x clear=%p riid=%s -> 0x%08lx %s gpuva=0x%llx", address, base, offset, desc->Width, desc->Flags, state,
-        clear, text, static_cast<unsigned long>(hr), placement, resource ? resource->GetGPUVirtualAddress() : 0ull);
+        "state=0x%x clear=%p riid=%s -> 0x%08lx %s gpuva=0x%llx%s", address, base, offset, desc->Width, desc->Flags, state,
+        clear, text, static_cast<unsigned long>(hr), placement, resource ? resource->GetGPUVirtualAddress() : 0ull, linear_note);
     if (FAILED(hr)) return hr;
+    if (linear.path == x2w_startup::LinearBuffers::kept_default_path) linear_buffers().kept_default(resource, linear);
     return publish_placed_buffer(self, address, desc, initial_state, resource, aliased, backing_budget, out);
 }
 

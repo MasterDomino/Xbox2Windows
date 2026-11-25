@@ -8,8 +8,9 @@
 //   unset or 0  the default: slot 133 keeps its backing (an existing heap cached by allocation
 //               base for a private range, otherwise a committed default buffer that does not alias
 //               the title memory and holds zeros). Nothing in this file runs.
-//   1           share when the adapter, the extent and the use allow it, else copy, else refuse.
-//   copy        never share; copy, else refuse.
+//   1           share when the adapter, the extent and the use allow it, else copy, else keep the
+//               default backing and record why.
+//   copy        never share; copy, else keep the default backing and record why.
 //
 // XMem owns the title memory (identity, mapping, offsets, lifetime); this file owns the desktop
 // backing and the fences that say when the GPU is done with it.
@@ -37,15 +38,25 @@
 // earlier submission on that queue; a title write to bytes that an incomplete submission still reads
 // is an unsynchronized concurrent write, outside the contract.
 //
-// Refuse, with a defined HRESULT, when the copy cannot keep the guarantees sharing would give:
-//   - a GPU-written use (ALLOW_UNORDERED_ACCESS): the copy has no point at which GPU writes reach the
-//     title memory. Slot 133 returns the sharing HRESULT, or DXGI_ERROR_UNSUPPORTED when sharing was
-//     not attempted (X2W_D3D12_LINEAR_BUFFERS=copy).
+// Where neither path can keep its guarantees, slot 133 keeps the default backing and returns what it
+// returns without this switch. A title on the console does not see CreatePlacedResourceX fail, so a
+// failed call would be a new failure (a title run that took the null object faulted at 1.76 s). The
+// refusal is recorded instead: in the slot 133 log line ("kept default backing: linear refusal
+// 0x..."), in x2w_d3d12_linear_buffer_info (path 3 and refusal_hr) and in the totals (kept_default,
+// last_refusal_hr). The refusals:
+//   - a GPU-written use (ALLOW_UNORDERED_ACCESS) that cannot be shared: the copy has no point at which
+//     GPU writes reach the title memory. refusal_hr is the sharing HRESULT, or DXGI_ERROR_UNSUPPORTED
+//     when sharing was not attempted (X2W_D3D12_LINEAR_BUFFERS=copy).
 //   - no submit fence (X2W_TEST_SUBMIT_FENCE_FAIL=1, or the fence cannot be created): staging reuse
-//     cannot wait for completion. Slot 133 returns E_NOT_VALID_STATE.
-//   - a submission whose refresh cannot be staged (the pool stays full past a 5 s wait, or creating a
-//     staging buffer or refresh list fails): the title's lists are not executed, and the HRESULT
-//     (DXGI_ERROR_WAS_STILL_DRAWING for the wait) is logged and kept in the totals.
+//     cannot wait for completion. E_NOT_VALID_STATE.
+//   - the copy's default buffer cannot be created: that HRESULT.
+//
+// At submit nothing is refused: holding back a submission can leave a title waiting on its fences.
+// When a copied buffer's refresh cannot be staged (a staging buffer or refresh list cannot be
+// created, or the pool stays full of buffers in flight past a 5 s wait: DXGI_ERROR_WAS_STILL_DRAWING),
+// the title's lists run with the backing's last upload. The buffer is marked stale until a later
+// refresh succeeds; the HRESULT is logged (the first few times) and kept in the buffer's info and the
+// totals (refresh_failures, last_refresh_hr).
 //
 // Fixtures only:
 //   X2W_TEST_EXISTING_HEAPS_UNSUPPORTED=1  the feature query reports no support (an adapter such as
@@ -55,12 +66,15 @@
 //     reuse-early      a staging buffer is reused without waiting for its fence
 //     copy-gpu-writes  the copy path accepts a GPU-written use
 //     ignore-feature   sharing is attempted although the feature query reports no support
+//     refusal-silent   a kept default backing is not reported (no log text, info or totals)
+//   X2W_TEST_LINEAR_REFRESH_FAIL=<n>       staging requests 2, 2 + n, 2 + 2n, ... fail with E_OUTOFMEMORY
 
 #include <windows.h>
 #include <d3d12.h>
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -110,6 +124,17 @@ inline bool existing_heaps_forced_off()
     static const bool on = x2w_local::env_on("X2W_TEST_EXISTING_HEAPS_UNSUPPORTED");
     return on;
 }
+inline unsigned refresh_fault_period()
+{
+    static const unsigned period = [] {
+        const DWORD saved = GetLastError();
+        char value[16]{};
+        const DWORD n = GetEnvironmentVariableA("X2W_TEST_LINEAR_REFRESH_FAIL", value, sizeof(value));
+        SetLastError(saved);
+        return n && n < sizeof(value) ? static_cast<unsigned>(std::strtoul(value, nullptr, 10)) : 0u;
+    }();
+    return period;
+}
 inline bool submit_fence_forced_off()
 {
     static const bool on = GetEnvironmentVariableW(L"X2W_TEST_SUBMIT_FENCE_FAIL", nullptr, 0) != 0;
@@ -136,7 +161,7 @@ class LinearBuffers {
     struct RefreshList;
 
 public:
-    enum Path : std::uint32_t { shared_path = 1, copied_path = 2 };
+    enum Path : std::uint32_t { shared_path = 1, copied_path = 2, kept_default_path = 3 };
     enum Use : std::uint32_t { gpu_read = 1, gpu_written = 2 };
 
     // The kind this file handles. Anything else keeps the default backing.
@@ -147,9 +172,13 @@ public:
                desc.Width && initial_state == D3D12_RESOURCE_STATE_COMMON;
     }
 
+    // False under the refusal-silent mutant: a kept default backing is then not reported anywhere.
+    static bool report_refusals() { return !linear_detail::mutant("refusal-silent"); }
+
     // Slot 133 for an eligible buffer. range is measure_placed_buffer's answer for (address, width) and
     // uav says whether the desktop flags keep ALLOW_UNORDERED_ACCESS. On success *out holds the
-    // desktop resource and *shared whether it aliases the title memory.
+    // desktop resource and *shared whether it aliases the title memory. A failure is a refusal: the
+    // caller keeps the default backing and passes *report (path kept_default_path) to kept_default().
     HRESULT place(ID3D12Device* device, void* address, UINT64 width, bool uav, const PlacedBufferRange& range,
                   ID3D12Resource** out, bool* shared, X2wLinearBufferInfo* report)
     {
@@ -214,25 +243,46 @@ public:
                 ++totals_.copied;
             }
         }
+        if (SUCCEEDED(hr)) {
+            record.info.backing = resource;
+            try {
+                records_.emplace(resource, std::move(record));
+            } catch (const std::bad_alloc&) {
+                hr = E_OUTOFMEMORY;
+                --(record.info.path == shared_path ? totals_.shared : totals_.copied);
+            }
+        }
         if (FAILED(hr)) {
-            ++totals_.refused;
-            totals_.last_refusal_hr = hr;
             if (resource) resource->Release();
+            record.info.path = kept_default_path;
+            record.info.refusal_hr = hr;
+            record.info.backing = nullptr;
             if (report) *report = record.info;
             return hr;
         }
-        record.info.backing = resource;
-        if (report) *report = record.info;
-        const bool is_shared = record.info.path == shared_path;
-        try {
-            records_.emplace(resource, std::move(record));
-        } catch (const std::bad_alloc&) {
-            resource->Release();
-            return E_OUTOFMEMORY;
-        }
+        const auto& stored = records_.at(resource).info;
+        if (report) *report = stored;
+        const bool is_shared = stored.path == shared_path;
         *out = resource;
         *shared = is_shared;
         return S_OK;
+    }
+
+    // Slot 133 kept the default backing for a refused placement: record why, for this resource.
+    void kept_default(ID3D12Resource* resource, const X2wLinearBufferInfo& report)
+    {
+        if (!report_refusals()) return;
+        std::lock_guard lock(mutex_);
+        ++totals_.kept_default;
+        totals_.last_refusal_hr = report.refusal_hr;
+        try {
+            Record record{};
+            record.info = report;
+            record.info.path = kept_default_path;
+            record.info.backing = resource;
+            records_.insert_or_assign(resource, std::move(record));
+        } catch (const std::bad_alloc&) {
+        }
     }
 
     // The resource never reached the title and is about to be released.
@@ -260,18 +310,17 @@ public:
     };
 
     // Before the title's lists are executed on queue (the contract's copy point): records and
-    // executes the refresh of every live copied buffer whose title bytes changed. A failure means the
-    // submission must not run; the HRESULT says why.
-    HRESULT before_submit(ID3D12CommandQueue* queue, Submission& submission)
+    // executes the refresh of every live copied buffer whose title bytes changed. Nothing here holds
+    // the submission back: a buffer whose refresh fails keeps its last upload and is marked stale.
+    void before_submit(ID3D12CommandQueue* queue, Submission& submission)
     {
         std::lock_guard lock(mutex_);
         ++totals_.submissions;
         bool any = false;
         for (auto& [resource, record] : records_) any |= record.copy && record.copy->live;
-        if (!any) return S_OK;
+        if (!any) return;
         QueueState* state = nullptr;
-        HRESULT hr = queue_state(queue, &state);
-        if (FAILED(hr)) return refuse_submit(submission, hr);
+        const HRESULT state_hr = queue_state(queue, &state);
         struct Op {
             ID3D12Resource* dest;
             Copied* copy;
@@ -294,55 +343,69 @@ public:
             }
             std::size_t first = 0, last = bytes;
             if (copy->uploaded.size() == bytes) {
-                if (std::memcmp(copy->uploaded.data(), source, bytes) == 0) continue;
+                if (std::memcmp(copy->uploaded.data(), source, bytes) == 0) {
+                    copy->stale = false;
+                    continue;
+                }
                 while (first < bytes && copy->uploaded[first] == source[first]) ++first;
                 while (last > first && copy->uploaded[last - 1] == source[last - 1]) --last;
                 first &= ~std::size_t{3};
                 last = (std::min)(bytes, (last + 3) & ~std::size_t{3});
-            } else {
-                try {
-                    copy->uploaded.assign(bytes, 0);
-                } catch (const std::bad_alloc&) {
-                    return refuse_submit(submission, E_OUTOFMEMORY);
-                }
             }
             const UINT64 span = last - first;
             Staging* staging = nullptr;
-            hr = take_staging(queue, span, submission, &staging);
-            if (FAILED(hr)) return refuse_submit(submission, hr);
-            try {
-                submission.staging.push_back(staging);
-                ops.push_back({resource, copy, first, staging, span});
-            } catch (const std::bad_alloc&) {
-                staging->value = 0;
-                return refuse_submit(submission, E_OUTOFMEMORY);
+            HRESULT hr = state_hr;
+            if (SUCCEEDED(hr)) hr = take_staging(queue, span, submission, &staging);
+            if (SUCCEEDED(hr)) {
+                try {
+                    submission.staging.push_back(staging);
+                    ops.push_back({resource, copy, first, staging, span});
+                } catch (const std::bad_alloc&) {
+                    hr = E_OUTOFMEMORY;
+                }
+            }
+            if (FAILED(hr)) {
+                if (staging && (submission.staging.empty() || submission.staging.back() != staging)) staging->value = 0;
+                refresh_failed(resource, *copy, hr);
+                continue;
             }
             std::memcpy(staging->mapped, source + first, static_cast<std::size_t>(span));
-            std::memcpy(copy->uploaded.data() + first, staging->mapped, static_cast<std::size_t>(span));
         }
-        if (ops.empty()) return S_OK;
+        if (ops.empty()) return;
         RefreshList* list = nullptr;
-        hr = take_list(queue, *state, &list);
-        if (FAILED(hr)) return refuse_submit(submission, hr);
-        // Buffers rest in COMMON: each copy promotes its destination to COPY_DEST, and it decays to
-        // COMMON again when this ExecuteCommandLists completes, before the title's lists use it.
-        for (const Op& op : ops) list->list->CopyBufferRegion(op.dest, op.offset, op.source->buffer, 0, op.bytes);
-        hr = list->list->Close();
+        HRESULT hr = take_list(queue, *state, &list);
+        if (SUCCEEDED(hr)) {
+            // Buffers rest in COMMON: each copy promotes its destination to COPY_DEST, and it decays to
+            // COMMON again when this ExecuteCommandLists completes, before the title's lists use it.
+            for (const Op& op : ops) list->list->CopyBufferRegion(op.dest, op.offset, op.source->buffer, 0, op.bytes);
+            hr = list->list->Close();
+            if (FAILED(hr)) list->value = 0;
+        }
         if (FAILED(hr)) {
-            list->value = 0;
-            return refuse_submit(submission, hr);
+            for (Staging* staging : submission.staging) staging->value = 0;
+            submission = {};
+            for (const Op& op : ops) refresh_failed(op.dest, *op.copy, hr);
+            return;
         }
         ID3D12CommandList* lists[] = {list->list};
         queue->ExecuteCommandLists(1, lists);
         submission.list = list;
         for (const Op& op : ops) {
-            ++op.copy->refreshes;
-            op.copy->bytes_copied += op.bytes;
-            op.copy->last_staging = op.source->id;
+            Copied& copy = *op.copy;
+            // The backing now holds these bytes (the staging buffer keeps them until its fence).
+            try {
+                if (copy.uploaded.size() != copy.bytes) copy.uploaded.assign(static_cast<std::size_t>(copy.bytes), 0);
+                std::memcpy(copy.uploaded.data() + op.offset, op.source->mapped, static_cast<std::size_t>(op.bytes));
+            } catch (const std::bad_alloc&) {
+                copy.uploaded.clear();  // the next submission copies the whole buffer again
+            }
+            copy.stale = false;
+            ++copy.refreshes;
+            copy.bytes_copied += op.bytes;
+            copy.last_staging = op.source->id;
             ++totals_.refreshes;
             totals_.bytes_copied += op.bytes;
         }
-        return S_OK;
     }
 
     // After the title's lists were executed on queue: the fence value that completes them also releases
@@ -382,6 +445,9 @@ public:
             out->bytes_copied = copy->bytes_copied;
             out->last_staging = copy->last_staging;
             out->last_fence = copy->last_fence;
+            out->stale = copy->stale ? 1 : 0;
+            out->refresh_failures = copy->refresh_failures;
+            out->last_refresh_hr = copy->last_refresh_hr;
         }
         return true;
     }
@@ -399,7 +465,9 @@ private:
         bool live = true;
         std::vector<unsigned char> uploaded;  // what the backing holds (empty before the first refresh)
         std::vector<unsigned char> bound;     // skip-refresh mutant: the bytes at placement
-        UINT64 refreshes = 0, bytes_copied = 0, last_staging = 0, last_fence = 0;
+        UINT64 refreshes = 0, bytes_copied = 0, last_staging = 0, last_fence = 0, refresh_failures = 0;
+        bool stale = false;
+        HRESULT last_refresh_hr = S_OK;
     };
     struct Record {
         X2wLinearBufferInfo info{};
@@ -528,6 +596,9 @@ private:
 
     HRESULT take_staging(ID3D12CommandQueue* queue, UINT64 bytes, const Submission& submission, Staging** out)
     {
+        if (const unsigned period = linear_detail::refresh_fault_period();
+            period && ++staging_requests_ % period == 2 % period)
+            return E_OUTOFMEMORY;  // fixture fault (X2W_TEST_LINEAR_REFRESH_FAIL)
         const bool early = linear_detail::mutant("reuse-early");
         for (int attempt = 0; attempt < 2; ++attempt) {
             Staging* best = nullptr;
@@ -617,20 +688,17 @@ private:
         return S_OK;
     }
 
-    HRESULT refuse_submit(Submission& submission, HRESULT hr)
+    // The submission runs without this buffer's refresh: its backing keeps the last upload.
+    void refresh_failed(ID3D12Resource* resource, Copied& copy, HRESULT hr)
     {
-        // Staging taken for this submission was not used on the GPU: free it again.
-        for (Staging* staging : submission.staging) staging->value = 0;
-        submission = {};
-        if (x2w_local::first_calls(refusal_logged_, 8))
-            x2w_local::logf("x2w-d3d12 linear buffers: submission refused 0x%08lx: the copied buffers could not be "
-                            "refreshed; the title's lists are not executed", static_cast<unsigned long>(hr));
-        ++totals_.submissions_refused;
-        totals_.last_submit_hr = hr;
-        // The bytes recorded as uploaded were not: the next submission copies the whole buffer again.
-        for (auto& [resource, record] : records_)
-            if (record.copy) record.copy->uploaded.clear();
-        return hr;
+        copy.stale = true;
+        ++copy.refresh_failures;
+        copy.last_refresh_hr = hr;
+        ++totals_.refresh_failures;
+        totals_.last_refresh_hr = hr;
+        if (x2w_local::first_calls(refresh_logged_, 8))
+            x2w_local::logf("x2w-d3d12 linear buffers: refresh of %p failed 0x%08lx; the submission runs with its last "
+                            "upload (stale)", static_cast<void*>(resource), static_cast<unsigned long>(hr));
     }
 
     std::mutex mutex_;
@@ -642,9 +710,9 @@ private:
     HRESULT feature_hr_ = S_FALSE;
     ID3D12Device* fence_check_device_ = nullptr;
     HRESULT fence_check_hr_ = S_OK;
-    UINT64 generation_ = 0, staging_ids_ = 0;
+    UINT64 generation_ = 0, staging_ids_ = 0, staging_requests_ = 0;
     X2wLinearBufferTotals totals_{};
-    volatile LONG unreadable_logged_ = 0, signal_logged_ = 0, refusal_logged_ = 0;
+    volatile LONG unreadable_logged_ = 0, signal_logged_ = 0, refresh_logged_ = 0;
 };
 
 }  // namespace x2w_startup
