@@ -86,6 +86,14 @@
 //     the lease path mirrors and publishes. HRESULT_FROM_WIN32(ERROR_BUSY): deferred to that owner, so
 //     the two never back one placement.
 //
+// Title memory is read twice per refresh: compared with the last upload under mutex_ (after a probe),
+// then staged without it. Every live copied buffer is snapshotted, not only those the submitted lists
+// read (the wrappers cannot tell), so the title may release one on another thread in between and free
+// or unmap its pages. Its memory is probed again right before it is staged, and staged under a fault
+// guard: a buffer that is gone is skipped and counted (unreadable), a read that faults anyway is
+// counted (copy_faults) and fails that buffer's refresh. A buffer released after the snapshot whose
+// pages are still there is staged for that submission, which may read it.
+//
 // At submit nothing is refused: holding back a submission can leave a title waiting on its fences.
 // When a copied buffer's refresh cannot be staged (a staging buffer or refresh list cannot be
 // created, or the pool stays full of buffers in flight past a 5 s wait: DXGI_ERROR_WAS_STILL_DRAWING),
@@ -116,6 +124,8 @@
 //     gpuw-at-record   the buffer stops being refreshed when the copy is recorded, not when it is submitted
 //     skip-producer-wait  a refresh does not Wait for earlier submissions (it may overwrite a backing in use)
 //     publish-out-of-order  an older refresh's span is applied to `uploaded` after a newer one's
+//     copy-after-retire  the title memory is not probed again right before it is staged (the fault guard
+//                      then catches the read of a released buffer's freed pages)
 //   x2w_d3d12_linear_buffer_internal_queue  returns the internal queue, so a fixture can hold refreshes
 //   X2W_TEST_LINEAR_STAGING_LIMIT=<n>      the staging pool holds n buffers instead of 256
 //   X2W_TEST_LINEAR_REFRESH_FAIL=<n>       staging requests 2, 2 + n, 2 + 2n, ... fail with E_OUTOFMEMORY
@@ -191,6 +201,18 @@ inline bool submit_fence_forced_off()
 {
     static const bool on = GetEnvironmentVariableW(L"X2W_TEST_SUBMIT_FENCE_FAIL", nullptr, 0) != 0;
     return on;
+}
+// Copies title memory that may have been freed or unmapped since it was probed: false on an access
+// violation or an in-page error instead of a fault in the DLL.
+inline bool guarded_copy(void* to, const void* from, std::size_t bytes) noexcept
+{
+    __try {
+        std::memcpy(to, from, bytes);
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION || GetExceptionCode() == EXCEPTION_IN_PAGE_ERROR
+                    ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        return false;
+    }
+    return true;
 }
 inline D3D12_RESOURCE_DESC buffer(UINT64 width, D3D12_RESOURCE_FLAGS flags)
 {
@@ -409,6 +431,8 @@ public:
             UINT64 offset, bytes;
             Staging* staging = nullptr;
             HRESULT hr = S_OK;
+            bool unreadable = false;  // the title memory was gone when it was to be staged
+            bool faulted = false;     // reading it faulted (caught)
         };
         std::vector<Work> work;
         {
@@ -765,7 +789,22 @@ private:
             w.hr = acquire_staging(w.bytes, taken, &w.staging);
             if (FAILED(w.hr)) continue;
             taken.push_back(w.staging);
-            std::memcpy(w.staging->mapped, w.source + w.offset, static_cast<std::size_t>(w.bytes));
+            // The snapshot probed the title memory under mutex_, but the title may have released this buffer
+            // since (any live buffer is snapshotted, not only those the lists read) and freed or unmapped its
+            // pages: probe again right before reading, and read under a fault guard.
+            const unsigned char* from = w.source + w.offset;
+            const auto bytes = static_cast<std::size_t>(w.bytes);
+            if (!linear_detail::mutant("copy-after-retire") &&
+                x2w_local::probe_readable(reinterpret_cast<std::uintptr_t>(from), bytes) < bytes) {
+                w.unreadable = true;
+                w.hr = HRESULT_FROM_WIN32(ERROR_NOACCESS);
+                continue;
+            }
+            if (!linear_detail::guarded_copy(w.staging->mapped, from, bytes)) {
+                w.faulted = true;
+                w.hr = HRESULT_FROM_WIN32(ERROR_NOACCESS);
+                continue;
+            }
             any_staged = true;
         }
         RefreshList* list = nullptr;
@@ -817,6 +856,19 @@ private:
         const UINT64 held = executed ? ~UINT64{0} : 0;
         if (list) list->value = value ? value : (FAILED(list_hr) ? held : value);
         for (Work& w : work) {
+            if (w.unreadable || w.faulted) {
+                w.staging->value = 0;  // never read by a copy: free again
+                if (w.faulted) {
+                    ++totals_.copy_faults;
+                    refresh_failed(w.dest, *w.copy, w.hr);
+                } else {
+                    ++totals_.unreadable;
+                    if (x2w_local::first_calls(unreadable_logged_, 4))
+                        x2w_local::logf("x2w-d3d12 linear buffer %p: title memory %p is no longer readable; its backing "
+                                        "keeps the last upload", static_cast<void*>(w.dest), static_cast<const void*>(w.source));
+                }
+                continue;
+            }
             const HRESULT hr = FAILED(w.hr) ? w.hr : list_hr;
             if (FAILED(hr)) {
                 if (w.staging) w.staging->value = held;
