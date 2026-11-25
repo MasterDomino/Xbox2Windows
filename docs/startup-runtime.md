@@ -1674,6 +1674,20 @@ These are measured on one executable; treat them as hypotheses for others.
     `slot 148 not implemented (missing slot)` and exits 10. A null for the valid request from an
     advertised slot exits 21, on the first call too. Both are failures. Only a missing physical
     adapter skips (77).
+  - **Serialized queues:** the held-phase observer read needs a second queue to progress while
+    the console queue waits on an unsignalled fence.
+    - **Preflight:** before the steps, the client checks this with a 1-second read of the
+      sentinel. Where the read cannot finish, it prints
+      `queues serialized: held-phase checks not applicable` and skips only the three held-phase
+      observer reads.
+    - **Still checked:** the in-list reads after the gate opens, the readback staying zero while
+      held, the controls, refusal after Close and the arguments.
+    - **Result:** the run passes with a final line that starts
+      `slot 148 acceptance passed with skips`. An adapter that passes the preflight and then stalls
+      still fails with exit 18.
+    - **Cleanup:** every exit opens the gate and drains both queues, with each wait bounded.
+    - **Forced variants:** `startup_slot148_acceptance_serialized_*` set
+      `X2W_TEST_FORCE_SERIALIZED_QUEUES=1` to take this path on adapters whose queues do progress.
   - **Run:** `cmake --build --preset release --target startup_slot148_acceptance` and
     `ctest --preset release --no-tests=error -R '^startup_slot148_acceptance_' -V`.
 - **Inline samplers.** Pixel shaders build sampler descriptors from constants (`s_movk_i32`,
