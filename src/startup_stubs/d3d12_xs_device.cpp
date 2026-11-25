@@ -1576,6 +1576,14 @@ extern "C" __declspec(dllexport) void x2w_d3d12_linear_buffer_totals(X2wLinearBu
     *totals = X2wLinearBufferTotals{};
     if (x2w_startup::linear_buffer_mode() != x2w_startup::LinearBufferMode::off) linear_buffers().totals(totals);
 }
+// Fixtures: the next refresh that reaches `point` (0 before staging, 1 after the title bytes are staged,
+// 2 after its copy was executed, before it is published) sets the `reached` event, then waits up to 20 s
+// for `resume`. Null events disarm the point. False with the switch off or for an unknown point.
+extern "C" __declspec(dllexport) bool x2w_d3d12_linear_buffer_test_pause(unsigned point, void* reached, void* resume)
+{
+    return x2w_startup::linear_buffer_mode() != x2w_startup::LinearBufferMode::off &&
+           linear_buffers().arm_pause(point, static_cast<HANDLE>(reached), static_cast<HANDLE>(resume));
+}
 // Fixtures: the internal queue that runs every refresh (AddRef'd), so a fixture can hold refreshes in
 // flight behind a fence of its own. False before the first copied placement.
 extern "C" __declspec(dllexport) bool x2w_d3d12_linear_buffer_internal_queue(void** queue)

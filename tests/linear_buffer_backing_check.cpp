@@ -79,6 +79,22 @@
 //        live), a copied one as a committed buffer; live while held, retained after the title's release.
 //   gpuw (copy only) a recorded copy (list slot 15) writes G into a copied buffer, then the title changes
 //        its first and last words: the buffer keeps G (it is no longer refreshed), reported as gpu_written.
+//   gpuw.discard (copy only) the same copy is recorded and closed, then the list is reset without a
+//        submission; the CPU writes B: the next read sees B and the buffer is not gpu_written.
+//   war  (copy only) a read of A on queue 1 behind a title gate (on the desktop queue); the CPU writes B and
+//        queue 2 submits a read. Its refresh's copy waits for queue 1 (producer_waits): queue 2 cannot
+//        complete while the gate is closed, queue 1 reads A and queue 2 reads B.
+//   xq.write (copy only) queue 1 waits through its wrapper (slot 17) on a title fence, then submits a read;
+//        the CPU writes B and queue 2 submits a read. The refresh must not wait for queue 1 (counted as a
+//        producer wait skip): queue 2 completes while queue 1 still waits, then the CPU reaches the fence
+//        and queue 1 reads B too.
+//   order (copy only) two threads refresh one buffer, parked through x2w_d3d12_linear_buffer_test_pause:
+//        thread A stages C and parks before its copy executes; the CPU writes D; thread B stages D, executes
+//        first and parks before publishing; A executes (the backing ends with C) and publishes, B publishes
+//        last. The next submission must refresh D (reordered_publishes +1) and read it.
+//   retire (copy only) a submission that reads Y snapshots the changed X and Y and parks before staging;
+//        the title releases X and frees its pages. X is skipped as unreadable (no copy fault, no failed
+//        refresh); Y reads C.
 //   lease (lease only) an XMem buffer keeps the default backing with HRESULT_FROM_WIN32(ERROR_BUSY)
 //        reported (old behaviour: reads zero); a private one is copied and reads B.
 //   pin  (share, XMem; measured, not asserted) a heap opened from an XMem view and a buffer placed on
@@ -93,11 +109,16 @@
 //   ignore-feature (refusal) case gate, refusal-silent (copy) case b (the kept default is not reported),
 //   hold-lock (contention) case contention (the wait keeps the backing's lock held),
 //   skip-consumer-wait (copy) case gate2q.held (no submission waits for the internal fence),
-//   refresh-gpu-written (copy) case gpuw (a refresh spanning the written words copies the title's A over G).
+//   refresh-gpu-written (copy) case gpuw (a refresh spanning the written words copies the title's A over G),
+//   gpuw-at-record (copy) case gpuw.discard (the buffer stops being refreshed when the copy is recorded),
+//   skip-producer-wait (copy) case war (the refresh's copy lands before queue 1's earlier read),
+//   publish-out-of-order (copy) case order (B's older publish is applied after A's: no further refresh),
+//   copy-after-retire (copy) case retire (no probe before staging: the fault guard catches the read).
 //
 // Refreshes run on an internal COPY queue that the DLL exports to fixtures
 // (x2w_d3d12_linear_buffer_internal_queue); cases c, contention and gate2q.held hold it behind a fence
-// of their own to keep a refresh in flight.
+// of their own to keep a refresh in flight. Cases order and retire park a refresh on its thread through
+// x2w_d3d12_linear_buffer_test_pause.
 // The run then exits 1 only if every targeted case failed, else 0 (negative controls, WILL_FAIL).
 // X2W_TEST_DEBUG_LAYER=1 enables the D3D12 debug layer; any stored error fails the run.
 // Returns 0 on pass, 1 on failure, 77 without the adapter, or on the share path when the adapter
@@ -126,6 +147,7 @@ extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*,
 extern "C" __declspec(dllimport) bool x2w_d3d12_linear_buffer_info(void*, X2wLinearBufferInfo*);
 extern "C" __declspec(dllimport) void x2w_d3d12_linear_buffer_totals(X2wLinearBufferTotals*);
 extern "C" __declspec(dllimport) bool x2w_d3d12_linear_buffer_internal_queue(void**);
+extern "C" __declspec(dllimport) bool x2w_d3d12_linear_buffer_test_pause(unsigned, void*, void*);
 extern "C" __declspec(dllimport) BOOL x2w_d3d12_budget_snapshot(x2w_budget::Snapshot*, SIZE_T);
 extern "C" __declspec(dllimport) void* WINAPI XMemVirtualAlloc(void*, SIZE_T, DWORD, ULONGLONG, DWORD);
 extern "C" __declspec(dllimport) BOOL WINAPI XMemAllocatePhysicalPages(ULONG_PTR, PULONG_PTR, PULONG_PTR);
@@ -1098,6 +1120,257 @@ struct Run {
                 "gpu_written " + std::to_string(p.info.gpu_written) + ", totals +" + std::to_string(after.gpu_written - before.gpu_written));
     }
 
+    // gpuw.discard (the review repro): a recorded copy into a copied buffer that is closed and then reset
+    // without being submitted. The buffer must stay refreshed: the next read sees the CPU's B, and it is
+    // not reported GPU-written.
+    void case_gpuw_discard(Pool& pool)
+    {
+        const char* name = "gpuw.discard";
+        Memory memory;
+        if (!pool.allocate(memory, A)) return row(pool, name, false, "allocation failed");
+        Placed p = place(gpu, memory.buffer(), false);
+        TitleList l0, l1, l2;
+        if (FAILED(p.hr) || !p.backing || !l0.begin(gpu) || !l1.begin(gpu) || !l2.begin(gpu))
+            return row(pool, name, false, "slot 133 -> " + hex(p.hr));
+        l0.read(p.backing.Get());
+        l0.close();
+        if (!gpu.wait(l0.submit())) return row(pool, name, false, "fence timeout");  // A uploaded and read
+        const X2wLinearBufferTotals before = totals();
+        // The title's copy of G into the buffer, recorded and closed on another list, then discarded.
+        invoke(l1.list.Get(), 15, arg(p.wrapper.Get()), r0, arg(gpu.source.Get()), 0, region_bytes);
+        const bool closed = l1.close();
+        const bool reset = SUCCEEDED(static_cast<HRESULT>(invoke(l1.list.Get(), 139, arg(l1.allocator.Get()))));
+        write(memory.buffer(), r0, B, words);
+        l2.read(p.backing.Get(), 1);
+        l2.close();
+        if (!gpu.wait(l2.submit())) return row(pool, name, false, "fence timeout");
+        const Tally t = tally(gpu.read_output(1).data(), r0 / 4, key);
+        refresh_info(p);
+        const X2wLinearBufferTotals after = totals();
+        const bool pass = closed && reset && p.linear && p.info.path == 2 && p.info.gpu_written == 0 && t.count[B] == words &&
+                          after.gpu_written == before.gpu_written && !p.info.stale;
+        row(pool, name, pass,
+            std::string("a copy of G recorded, closed ") + (closed ? "" : "(CLOSE FAILED) ") + "and reset " +
+                (reset ? "" : "(RESET FAILED) ") + "without a submission, then the CPU wrote B: the GPU read " + t.text() +
+                " (expected B: still refreshed); gpu_written " + std::to_string(p.info.gpu_written) + ", totals +" +
+                std::to_string(after.gpu_written - before.gpu_written));
+    }
+
+    // war: a read of A on queue 1 is held behind a title gate (on the desktop queue, past the wrapper); the
+    // CPU then writes B and queue 2 submits a read, whose refresh must not land before queue 1's read: queue
+    // 1 reads A, queue 2 reads B, and the refresh's copy waited for queue 1 (producer_waits).
+    void case_war(Pool& pool)
+    {
+        const char* name = "war";
+        Lane q2;
+        Memory memory;
+        if (!gpu.lane(q2, D3D12_COMMAND_LIST_TYPE_DIRECT) || !pool.allocate(memory, A)) return row(pool, name, false, "setup failed");
+        Placed x = place(gpu, memory.buffer(), false);
+        TitleList l0, l1, l2;
+        if (FAILED(x.hr) || !x.backing || !l0.begin(gpu) || !l1.begin(gpu) || !l2.begin(gpu))
+            return row(pool, name, false, "slot 133 -> " + hex(x.hr));
+        l0.read(x.backing.Get());
+        l0.close();
+        if (!gpu.wait(l0.submit())) return row(pool, name, false, "fence timeout");  // A uploaded and read
+        l1.read(x.backing.Get(), 1);
+        l1.close();
+        l2.read(x.backing.Get(), 2);
+        l2.close();
+        const X2wLinearBufferTotals before = totals();
+        gpu.hold();
+        const UINT64 v1 = l1.submit();  // queue 1, gated: nothing to refresh (the title still holds A)
+        write(memory.buffer(), r0, B, words);
+        const UINT64 v2 = l2.submit_on(q2);  // its refresh (B) is ordered behind queue 1's read
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        const bool q2_held = q2.fence->GetCompletedValue() < v2;
+        const bool q1_pending = gpu.done->GetCompletedValue() < v1;
+        gpu.open_gate();
+        const bool q1_done = gpu.wait(v1), q2_done = wait_fence(q2.fence.Get(), v2);
+        if (!q1_done || !q2_done) return row(pool, name, false, "fence timeout after the gate");
+        const Tally t1 = tally(gpu.read_output(1).data(), r0 / 4, key), t2 = tally(gpu.read_output(2).data(), r0 / 4, key);
+        refresh_info(x);
+        const X2wLinearBufferTotals after = totals();
+        const bool pass = q1_pending && q2_held && t1.count[A] == words && t2.count[B] == words && !x.info.stale &&
+                          x.info.refresh_failures == 0 && after.producer_waits > before.producer_waits;
+        row(pool, name, pass,
+            std::string("queue 1 ") + (q1_pending ? "gated" : "NOT GATED") + " with a read of A; after the CPU wrote B, queue 2 " +
+                (q2_held ? "waited for it" : "COMPLETED FIRST (the refresh did not wait)") + "; queue 1 read " + t1.text() +
+                " (expected A), queue 2 read " + t2.text() + " (expected B); producer waits +" +
+                std::to_string(after.producer_waits - before.producer_waits));
+    }
+
+    // xq.write: queue 1 waits through its wrapper (queue slot 17) on a title fence, then submits a read; the CPU
+    // writes B and queue 2 submits a read. The refresh must not wait for queue 1 (the fence is reached only
+    // later, here by the CPU once queue 2 is done; a title can equally signal it from queue 2): queue 2 completes
+    // while queue 1 still waits, both read B, and the skip is counted.
+    void case_xq_write(Pool& pool)
+    {
+        const char* name = "xq.write";
+        Lane q2;
+        Memory memory;
+        ComPtr<IUnknown> fence;
+        if (!gpu.lane(q2, D3D12_COMMAND_LIST_TYPE_DIRECT) || !pool.allocate(memory, A) ||
+            FAILED(static_cast<HRESULT>(invoke(gpu.guest.Get(), 36, 0, D3D12_FENCE_FLAG_NONE, arg(&__uuidof(ID3D12Fence)),
+                                               arg(fence.GetAddressOf())))) || !fence)
+            return row(pool, name, false, "setup failed");
+        Placed x = place(gpu, memory.buffer(), false);
+        TitleList l0, l1, l2;
+        if (FAILED(x.hr) || !x.backing || !l0.begin(gpu) || !l1.begin(gpu) || !l2.begin(gpu))
+            return row(pool, name, false, "slot 133 -> " + hex(x.hr));
+        l0.read(x.backing.Get());
+        l0.close();
+        if (!gpu.wait(l0.submit())) return row(pool, name, false, "fence timeout");
+        l1.read(x.backing.Get(), 1);
+        l1.close();
+        l2.read(x.backing.Get(), 2);
+        l2.close();
+        const X2wLinearBufferTotals before = totals();
+        if (FAILED(static_cast<HRESULT>(invoke(gpu.guest_queue.Get(), 17, arg(fence.Get()), 1))))
+            return row(pool, name, false, "queue wait (slot 17) failed");
+        const UINT64 v1 = l1.submit();
+        write(memory.buffer(), r0, B, words);
+        const UINT64 v2 = l2.submit_on(q2);
+        const bool q2_done = wait_fence(q2.fence.Get(), v2);
+        const bool q1_pending = gpu.done->GetCompletedValue() < v1;
+        invoke(fence.Get(), 10, 1);  // the title's fence, from the CPU (fence slot 10)
+        const bool q1_done = gpu.wait(v1);
+        if (!q2_done && !wait_fence(q2.fence.Get(), v2)) return row(pool, name, false, "fence timeout (queue 2)");
+        const Tally t1 = tally(gpu.read_output(1).data(), r0 / 4, key), t2 = tally(gpu.read_output(2).data(), r0 / 4, key);
+        const X2wLinearBufferTotals after = totals();
+        const bool pass = q2_done && q1_pending && q1_done && t1.count[B] == words && t2.count[B] == words &&
+                          after.producer_wait_skips > before.producer_wait_skips;
+        row(pool, name, pass,
+            std::string("queue 1 behind a title Wait (slot 17); queue 2 ") +
+                (q2_done ? "completed" : "DID NOT COMPLETE (the refresh waited for queue 1: deadlock)") + " while queue 1 " +
+                (q1_pending ? "still waited" : "HAD RUN") + " and read " + t2.text() + "; queue 1 " + (q1_done ? "then read " : "DID NOT COMPLETE, read ") +
+                t1.text() + "; producer wait skips +" + std::to_string(after.producer_wait_skips - before.producer_wait_skips));
+    }
+
+    // order: two threads' refreshes of one buffer, driven through the pause hook. Thread A stages C and parks
+    // before its copy is executed; the CPU writes D; thread B stages D, executes its copy first (the lower
+    // internal value) and parks before publishing; A then executes (the higher value: the backing ends with C)
+    // and publishes; B publishes last. The next submission must refresh D, which the GPU then reads.
+    void case_order(Pool& pool)
+    {
+        const char* name = "order";
+        Lane q2;
+        Memory memory;
+        if (!gpu.lane(q2, D3D12_COMMAND_LIST_TYPE_DIRECT) || !pool.allocate(memory, A)) return row(pool, name, false, "setup failed");
+        Placed x = place(gpu, memory.buffer(), false);
+        TitleList l0, la, lb, lc;
+        if (FAILED(x.hr) || !x.backing || !l0.begin(gpu) || !la.begin(gpu) || !lb.begin(gpu) || !lc.begin(gpu))
+            return row(pool, name, false, "slot 133 -> " + hex(x.hr));
+        l0.read(x.backing.Get());
+        l0.close();
+        if (!gpu.wait(l0.submit())) return row(pool, name, false, "fence timeout");  // A uploaded
+        la.read(x.backing.Get(), 1);
+        la.close();
+        lb.read(x.backing.Get(), 2);
+        lb.close();
+        lc.read(x.backing.Get(), 3);
+        lc.close();
+        HANDLE staged = CreateEventW(nullptr, TRUE, FALSE, nullptr), staged_go = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        HANDLE executed = CreateEventW(nullptr, TRUE, FALSE, nullptr), executed_go = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        const auto close_events = [&] {
+            x2w_d3d12_linear_buffer_test_pause(1, nullptr, nullptr);  // disarm what no refresh reached
+            x2w_d3d12_linear_buffer_test_pause(2, nullptr, nullptr);
+            for (HANDLE h : {staged, staged_go, executed, executed_go})
+                if (h) CloseHandle(h);
+        };
+        if (!staged || !staged_go || !executed || !executed_go || !x2w_d3d12_linear_buffer_test_pause(1, staged, staged_go)) {
+            close_events();
+            return row(pool, name, false, "pause hook not available");
+        }
+        const X2wLinearBufferTotals before = totals();
+        write(memory.buffer(), r0, C, words);
+        UINT64 va = 0, vb = 0;
+        std::thread ta([&] { va = la.submit(); });
+        const bool a_parked = WaitForSingleObject(staged, 5000) == WAIT_OBJECT_0;
+        write(memory.buffer(), r0, D, words);
+        const bool armed = x2w_d3d12_linear_buffer_test_pause(2, executed, executed_go);
+        std::thread tb([&] { vb = lb.submit_on(q2); });
+        const bool b_parked = armed && WaitForSingleObject(executed, 5000) == WAIT_OBJECT_0;
+        SetEvent(staged_go);  // A executes after B and publishes first
+        ta.join();
+        SetEvent(executed_go);  // then B publishes
+        tb.join();
+        close_events();
+        if (!gpu.wait(va) || !wait_fence(q2.fence.Get(), vb)) return row(pool, name, false, "fence timeout");
+        const UINT64 vc = lc.submit();
+        if (!gpu.wait(vc)) return row(pool, name, false, "fence timeout");
+        const Tally t = tally(gpu.read_output(3).data(), r0 / 4, key);
+        refresh_info(x);
+        const X2wLinearBufferTotals after = totals();
+        const bool pass = a_parked && b_parked && t.count[D] == words && after.reordered_publishes == before.reordered_publishes + 1 &&
+                          !x.info.stale && x.info.refresh_failures == 0;
+        row(pool, name, pass,
+            std::string("thread A staged C ") + (a_parked ? "and parked" : "BUT DID NOT PARK") + ", thread B staged D and executed first " +
+                (b_parked ? "and parked" : "BUT DID NOT PARK") + "; A executed and published, then B: the next submission read " + t.text() +
+                " (expected D: the older publish dropped the upload record); reordered publishes +" +
+                std::to_string(after.reordered_publishes - before.reordered_publishes));
+    }
+
+    // retire: a submission that reads Y snapshots both changed buffers X and Y and parks before staging; the
+    // title releases X and frees its pages; the submission resumes. X must be skipped as unreadable (no
+    // fault, no failed refresh); Y is refreshed and read.
+    void case_retire(Pool& pool)
+    {
+        const char* name = "retire";
+        Memory mx, my;
+        // A private X gets an allocation of its own: the pool's range is pinned by the heap that the default
+        // backing opened on it (case b), so its pages cannot be decommitted.
+        if (!pool.xmem) {
+            mx.cpu = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, alloc_pages * page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+            if (mx.cpu) {
+                write(mx.cpu, 0, neighbour, buffer_offset / 4);
+                write(mx.buffer(), 0, A, buffer_bytes / 4);
+            }
+        }
+        if ((pool.xmem ? !pool.allocate(mx, A) : !mx.cpu) || !pool.allocate(my, A)) return row(pool, name, false, "allocation failed");
+        Placed x = place(gpu, mx.buffer(), false), y = place(gpu, my.buffer(), false);
+        TitleList l0, la;
+        if (FAILED(x.hr) || FAILED(y.hr) || !x.backing || !y.backing || !l0.begin(gpu) || !la.begin(gpu))
+            return row(pool, name, false, "slot 133 -> " + hex(x.hr) + "/" + hex(y.hr));
+        l0.read(x.backing.Get());
+        l0.close();
+        if (!gpu.wait(l0.submit())) return row(pool, name, false, "fence timeout");  // both uploaded
+        la.read(y.backing.Get(), 1);
+        la.close();
+        HANDLE parked = CreateEventW(nullptr, TRUE, FALSE, nullptr), go = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!parked || !go || !x2w_d3d12_linear_buffer_test_pause(0, parked, go)) {
+            if (parked) CloseHandle(parked);
+            if (go) CloseHandle(go);
+            return row(pool, name, false, "pause hook not available");
+        }
+        write(mx.buffer(), r0, B, words);
+        write(my.buffer(), r0, C, words);
+        const X2wLinearBufferTotals before = totals();
+        UINT64 va = 0;
+        std::thread ta([&] { va = la.submit(); });
+        const bool was_parked = WaitForSingleObject(parked, 5000) == WAIT_OBJECT_0;
+        auto* x_wrapper = x.wrapper.Get();
+        x.wrapper.Reset();  // release(): retire X
+        const bool freed = pool.xmem ? pool.release(mx) : VirtualFree(mx.cpu, 0, MEM_RELEASE) != FALSE;
+        SetEvent(go);
+        ta.join();
+        x2w_d3d12_linear_buffer_test_pause(0, nullptr, nullptr);  // disarm, if no refresh reached it
+        CloseHandle(parked);
+        CloseHandle(go);
+        if (!gpu.wait(va)) return row(pool, name, false, "fence timeout");
+        const Tally t = tally(gpu.read_output(1).data(), r0 / 4, key);
+        X2wLinearBufferInfo xi{};
+        x2w_d3d12_linear_buffer_info(x_wrapper, &xi);
+        refresh_info(y);
+        const X2wLinearBufferTotals after = totals();
+        const bool pass = was_parked && freed && t.count[C] == words && after.unreadable == before.unreadable + 1 &&
+                          after.copy_faults == before.copy_faults && xi.refresh_failures == 0 && !y.info.stale;
+        row(pool, name, pass,
+            std::string("parked after the snapshot ") + (was_parked ? "" : "(DID NOT PARK) ") + "while the title released X and " +
+                (freed ? "freed" : "COULD NOT FREE") + " its pages: unreadable +" + std::to_string(after.unreadable - before.unreadable) +
+                " (expected 1), copy faults +" + std::to_string(after.copy_faults - before.copy_faults) + " (expected 0), X refresh failures " +
+                std::to_string(xi.refresh_failures) + "; Y read " + t.text());
+    }
+
     // lease: with the mesh XMem lease path on, an XMem placement with console flags 0 is the lease path's:
     // slot 133 keeps the default backing (not aliased) and records the deferral; a private one is copied.
     void case_lease(Pool& pool)
@@ -1444,6 +1717,11 @@ int main(int argc, char** argv)
             run.case_xq(pool);
             run.case_budget(pool);
             run.case_gpuw(pool);
+            run.case_gpuw_discard(pool);
+            run.case_war(pool);
+            run.case_xq_write(pool);
+            run.case_order(pool);
+            run.case_retire(pool);  // last: it frees the pages of one buffer
         }
         run.probe_view_pin(pool);
         if (path == Path::share) run.case_budget(pool);
@@ -1451,7 +1729,8 @@ int main(int argc, char** argv)
     const X2wLinearBufferTotals t = totals();
     std::printf("totals: placements %llu (shared %llu, copied %llu, kept default %llu), feature queries %llu, heap opens %llu "
                 "(failed %llu, cache hits %llu), placements failed %llu, submissions %llu, refreshes %llu, bytes copied %llu, "
-                "staging created %llu reused %llu, unreadable %llu, refresh failures %llu, last refusal %s, last refresh failure %s\n",
+                "staging created %llu reused %llu, unreadable %llu, refresh failures %llu, consumer waits %llu, producer waits %llu "
+                "(skipped %llu), gpu written %llu, reordered publishes %llu, copy faults %llu, last refusal %s, last refresh failure %s\n",
                 static_cast<unsigned long long>(t.placements), static_cast<unsigned long long>(t.shared),
                 static_cast<unsigned long long>(t.copied), static_cast<unsigned long long>(t.kept_default),
                 static_cast<unsigned long long>(t.feature_queries), static_cast<unsigned long long>(t.heap_opens),
@@ -1460,6 +1739,9 @@ int main(int argc, char** argv)
                 static_cast<unsigned long long>(t.refreshes), static_cast<unsigned long long>(t.bytes_copied),
                 static_cast<unsigned long long>(t.staging_created), static_cast<unsigned long long>(t.staging_reused),
                 static_cast<unsigned long long>(t.unreadable), static_cast<unsigned long long>(t.refresh_failures),
+                static_cast<unsigned long long>(t.consumer_waits), static_cast<unsigned long long>(t.producer_waits),
+                static_cast<unsigned long long>(t.producer_wait_skips), static_cast<unsigned long long>(t.gpu_written),
+                static_cast<unsigned long long>(t.reordered_publishes), static_cast<unsigned long long>(t.copy_faults),
                 hex(t.last_refusal_hr).c_str(), hex(t.last_refresh_hr).c_str());
     {
         Pool none(false);
@@ -1497,7 +1779,9 @@ int main(int argc, char** argv)
         const char* target = mutant == "skip-refresh" ? "a" : mutant == "reuse-early" ? "c" : mutant == "copy-gpu-writes" ? "b"
                            : mutant == "ignore-feature" ? "gate" : mutant == "refusal-silent" ? "b"
                            : mutant == "hold-lock" ? "contention" : mutant == "skip-consumer-wait" ? "gate2q.held"
-                           : mutant == "refresh-gpu-written" ? "gpuw" : nullptr;
+                           : mutant == "refresh-gpu-written" ? "gpuw" : mutant == "gpuw-at-record" ? "gpuw.discard"
+                           : mutant == "skip-producer-wait" ? "war" : mutant == "publish-out-of-order" ? "order"
+                           : mutant == "copy-after-retire" ? "retire" : nullptr;
         if (!target) return 2;
         unsigned targeted = 0, failed = 0;
         for (const auto& [name, pass] : run.results)

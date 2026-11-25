@@ -126,6 +126,9 @@
 //     publish-out-of-order  an older refresh's span is applied to `uploaded` after a newer one's
 //     copy-after-retire  the title memory is not probed again right before it is staged (the fault guard
 //                      then catches the read of a released buffer's freed pages)
+//   x2w_d3d12_linear_buffer_test_pause      parks the next refresh at one point (before staging, after
+//                                          staging, after its copy executed), so a fixture can order two
+//                                          threads' refreshes or release a buffer while one is parked
 //   x2w_d3d12_linear_buffer_internal_queue  returns the internal queue, so a fixture can hold refreshes
 //   X2W_TEST_LINEAR_STAGING_LIMIT=<n>      the staging pool holds n buffers instead of 256
 //   X2W_TEST_LINEAR_REFRESH_FAIL=<n>       staging requests 2, 2 + n, 2 + 2n, ... fail with E_OUTOFMEMORY
@@ -134,6 +137,7 @@
 #include <d3d12.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -540,6 +544,21 @@ public:
         }
     }
 
+    // Fixtures only (x2w_d3d12_linear_buffer_test_pause): the next refresh that reaches `point` sets
+    // `reached`, then waits up to 20 s for `resume`, holding no lock. One shot per arming. The points:
+    // before its staging (after the snapshot), after the title bytes are staged (before its copy is
+    // executed), and after the copy is executed and signalled (before it is published). Null events
+    // disarm the point, so a fixture can close its events when no refresh came.
+    enum PausePoint : unsigned { pause_before_stage, pause_after_stage, pause_after_execute, pause_points };
+    bool arm_pause(unsigned point, HANDLE reached, HANDLE resume)
+    {
+        if (point >= pause_points) return false;
+        std::lock_guard lock(pause_mutex_);
+        pauses_[point] = reached && resume ? Pause{reached, resume} : Pause{};
+        if (pauses_[point].reached) pauses_armed_.store(true);
+        return true;
+    }
+
     // The internal queue, AddRef'd, for fixtures that hold refreshes in flight; null before the first
     // copied placement.
     ID3D12CommandQueue* internal_queue()
@@ -637,6 +656,21 @@ private:
             return parsed ? static_cast<std::size_t>(parsed) : std::size_t{256};
         }();
         return limit;
+    }
+
+    // A fixture's pause (arm_pause); nothing unless one was armed.
+    void pause_at(unsigned point)
+    {
+        if (!pauses_armed_.load()) return;
+        Pause pause{};
+        {
+            std::lock_guard lock(pause_mutex_);
+            pause = pauses_[point];
+            pauses_[point] = {};
+        }
+        if (!pause.reached) return;
+        SetEvent(pause.reached);
+        WaitForSingleObject(pause.resume, 20000);
     }
 
     // Under mutex_. The record of `queue`, created on first use; null if it cannot be stored.
@@ -783,6 +817,7 @@ private:
     template <class Work>
     UINT64 refresh(std::vector<Work>& work)
     {
+        pause_at(pause_before_stage);
         std::vector<Staging*> taken;
         bool any_staged = false;
         for (Work& w : work) {
@@ -807,6 +842,7 @@ private:
             }
             any_staged = true;
         }
+        if (any_staged) pause_at(pause_after_stage);
         RefreshList* list = nullptr;
         HRESULT list_hr = S_OK;
         bool executed = false;
@@ -841,6 +877,7 @@ private:
                 if (SUCCEEDED(list_hr)) value = ++internal_value_;
             }
         }
+        if (executed) pause_at(pause_after_execute);
 
         // Publish under the lock. Two submissions on different threads can snapshot one buffer against the
         // same `uploaded`, stage the title's bytes at different times (X, then the CPU writes Y, then Y),
@@ -1075,6 +1112,12 @@ private:
     std::vector<std::unique_ptr<Staging>> staging_;
     std::vector<Heap> heaps_;
     std::vector<UserQueue> users_;  // under mutex_
+    struct Pause {
+        HANDLE reached = nullptr, resume = nullptr;
+    };
+    std::mutex pause_mutex_;  // fixtures' pauses (a leaf: nothing else is taken under it)
+    Pause pauses_[pause_points];
+    std::atomic<bool> pauses_armed_{false};
     ID3D12Device* feature_device_ = nullptr;
     HRESULT feature_hr_ = S_FALSE;
     UINT64 generation_ = 0, staging_ids_ = 0, staging_requests_ = 0;
