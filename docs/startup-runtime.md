@@ -1677,9 +1677,9 @@ These are measured on one executable; treat them as hypotheses for others.
   - **Serialized queues:** the held-phase observer read needs a second queue to progress while
     the console queue waits on an unsignalled fence.
     - **Preflight:** before the steps, the client checks this with a 1-second read of the
-      sentinel. Where the read cannot finish, it prints
-      `queues serialized: held-phase checks not applicable` and skips only the three held-phase
-      observer reads.
+      sentinel. If the read times out but later drains and matches after the gate opens, it prints
+      `queues serialized: held-phase checks not applicable` and skips the three held-phase
+      observer reads. A failed setup, wait or readback keeps the test failing.
     - **Still checked:** the in-list reads after the gate opens, the readback staying zero while
       held, the controls, refusal after Close and the arguments.
     - **Result:** the run passes with a final line that starts

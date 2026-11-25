@@ -444,18 +444,26 @@ struct Client {
                SUCCEEDED(desktop->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&observer_fence))) &&
                make_reads(observed);
     }
-    // Waits up to `ms` for a desktop fence to reach value.
-    static bool fence_reached(ID3D12Fence* fence, UINT64 value, DWORD ms)
+    enum class ObserverResult { complete, timeout, failure };
+
+    static ObserverResult wait_observer(ID3D12Fence* fence, UINT64 value, DWORD ms)
     {
-        if (fence->GetCompletedValue() >= value) return true;
+        if (fence->GetCompletedValue() >= value) return ObserverResult::complete;
         HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        const bool reached = event && SUCCEEDED(fence->SetEventOnCompletion(value, event)) &&
-                             WaitForSingleObject(event, ms) == WAIT_OBJECT_0;
-        if (event) CloseHandle(event);
-        return reached;
+        if (!event) return ObserverResult::failure;
+        const DWORD waited = SUCCEEDED(fence->SetEventOnCompletion(value, event))
+            ? WaitForSingleObject(event, ms) : WAIT_FAILED;
+        CloseHandle(event);
+        if (waited == WAIT_OBJECT_0) return ObserverResult::complete;
+        if (waited == WAIT_TIMEOUT) return ObserverResult::timeout;
+        return ObserverResult::failure;
     }
     // Bounded drains: every submission on the observer or console queue so far has completed.
-    bool drain_observer() { return !observer_fence || fence_reached(observer_fence.Get(), observer_value, kWaitMs); }
+    bool drain_observer()
+    {
+        return !observer_fence ||
+            wait_observer(observer_fence.Get(), observer_value, kWaitMs) == ObserverResult::complete;
+    }
     bool drain_console()
     {
         void* drained = queue ? fence() : nullptr;
@@ -463,11 +471,11 @@ struct Client {
     }
     // The observer: copies [first, first + 0x280) and [second, second + 0x280) on the GPU, in order. A
     // read that does not finish within `ms` stays pending; drain_observer() waits for it.
-    bool read(Word first, Word second, std::vector<unsigned char>& out, DWORD ms = kWaitMs)
+    ObserverResult read(Word first, Word second, std::vector<unsigned char>& out, DWORD ms = kWaitMs)
     {
         if (!drain_observer() || FAILED(observer_allocator->Reset()) ||
             FAILED(observer_list->Reset(observer_allocator.Get(), copy.Get())))
-            return false;
+            return ObserverResult::failure;
         observer_list->SetComputeRootSignature(root.Get());
         const Word sources[] = {first, second};
         for (Word i = 0; i < 2; ++i) {
@@ -480,11 +488,13 @@ struct Client {
         observer_list->CopyBufferRegion(observed.readback.Get(), 0, observed.target.Get(), 0, 2 * kBytes);
         transition(observer_list.Get(), observed.target.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        if (FAILED(observer_list->Close())) return false;
+        if (FAILED(observer_list->Close())) return ObserverResult::failure;
         ID3D12CommandList* lists[] = {observer_list.Get()};
         observer->ExecuteCommandLists(1, lists);
-        if (FAILED(observer->Signal(observer_fence.Get(), ++observer_value))) return false;
-        return fence_reached(observer_fence.Get(), observer_value, ms) && map_bytes(observed.readback.Get(), out);
+        if (FAILED(observer->Signal(observer_fence.Get(), ++observer_value))) return ObserverResult::failure;
+        const auto result = wait_observer(observer_fence.Get(), observer_value, ms);
+        if (result != ObserverResult::complete) return result;
+        return map_bytes(observed.readback.Get(), out) ? ObserverResult::complete : ObserverResult::failure;
     }
 
     // Preflight: can the observer queue finish a read while the console queue waits on an unsignalled
@@ -496,21 +506,25 @@ struct Client {
         if (!probe_gate || !ok(invoke(queue, kQueueWait, arg(probe_gate), 1))) return -1;
         std::vector<unsigned char> bytes;
         const Word base = sentinel->GetGPUVirtualAddress();
-        const bool progressed = read(base, base, bytes, 1000);
-        invoke(probe_gate, kFenceSignal, 1);
-        if (!drain_observer() || !drain_console()) return -1;
-        if (progressed) {
-            for (Word i = 0; i < 2 * kBytes; ++i)
-                if (bytes[i] != pattern(kSentinel, i % kBytes)) return -1;
-        }
-        return progressed ? 1 : 0;
+        const auto observed_result = read(base, base, bytes, 1000);
+        const bool opened = ok(invoke(probe_gate, kFenceSignal, 1));
+        const bool observer_drained = drain_observer();
+        const bool console_drained = drain_console();
+        if (!opened || !observer_drained || !console_drained || observed_result == ObserverResult::failure)
+            return -1;
+        if (observed_result == ObserverResult::timeout && !map_bytes(observed.readback.Get(), bytes)) return -1;
+        for (Word i = 0; i < 2 * kBytes; ++i)
+            if (bytes[i] != pattern(kSentinel, i % kBytes)) return -1;
+        return observed_result == ObserverResult::complete ? 1 : 0;
     }
 
     // Leaves no work pending at exit: drains both queues (bounded). If a drain does not finish, the
     // desktop objects are kept (leaked) rather than released while the GPU may still use them.
     ~Client()
     {
-        if (drain_observer() && drain_console()) return;
+        const bool observer_drained = drain_observer();
+        const bool console_drained = drain_console();
+        if (observer_drained && console_drained) return;
         std::printf("cleanup: queues did not drain within %lu ms; desktop objects are kept\n",
                     static_cast<unsigned long>(kWaitMs));
         observed.target.Detach();
@@ -629,7 +643,7 @@ int held_sequence(Client& c, Mode mode)
                     "(expected 1, 0); queues serialized: held-phase observer read not applicable\n",
                     label, untouched ? 1 : 0, static_cast<unsigned long long>(before));
     } else {
-        read = c.read(first.gpu, second.gpu, observed);
+        read = c.read(first.gpu, second.gpu, observed) == Client::ObserverResult::complete;
         after = invoke(done, kFenceCompleted);
         std::printf("%s: while held, in-list readback untouched = %d; console submissions completed before the "
                     "observer read %llu, after it %llu (expected 1, 0, 0)\n",
@@ -679,7 +693,7 @@ int forced_reuse(Client& c)
     // A's range is live again as part of B, so reading it is defined. Byte i of A's range is byte
     // i - shift of B, where shift is B's start relative to A's.
     std::vector<unsigned char> bytes;
-    if (!c.read(first.gpu, second.gpu, bytes)) return ordering;
+    if (c.read(first.gpu, second.gpu, bytes) != Client::ObserverResult::complete) return ordering;
     const Word from = second.gpu > first.gpu ? second.gpu - first.gpu : 0;
     const Word to = (std::min)(kBytes, second.gpu + kBytes - first.gpu);
     for (Word i = from; i < to; ++i) {
@@ -825,7 +839,7 @@ int main(int argc, char** argv)
     const int progress = c.queues_progress();
     const bool forced = GetEnvironmentVariableA("X2W_TEST_FORCE_SERIALIZED_QUEUES", debug, sizeof(debug)) && debug[0] == '1';
     std::printf("preflight: the observer queue %s while the console queue waited on an unsignalled fence%s\n",
-                progress > 0 ? "finished a read" : progress == 0 ? "made no progress" : "did not drain",
+                progress > 0 ? "finished a read" : progress == 0 ? "made no progress" : "failed the probe",
                 forced ? "; X2W_TEST_FORCE_SERIALIZED_QUEUES=1" : "");
     if (progress < 0) return ordering;
     c.serialized = forced || progress == 0;
