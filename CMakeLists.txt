@@ -2588,21 +2588,22 @@ endforeach()
 # The production slice (#1914): slot 133's opt-in linear-buffer backing (X2W_D3D12_LINEAR_BUFFERS,
 # src/startup_stubs/linear_buffer_backing.h) through the device and queue wrappers of d3d12_xs.dll, over
 # XMem pages and a private range: the default, real sharing, forced copying, host sharing refusal, a
-# copy without a submit fence (the default backing is kept and the refusal reported) and a refresh
-# that cannot be staged (the submission runs, the buffer is reported stale). Each mutant removes one
-# guarantee in the DLL and must fail its case.
+# copy without a submit fence (the default backing is kept and the refusal reported), a refresh that
+# cannot be staged (the submission runs, the buffer is reported stale) and a one-buffer staging pool
+# (a waiting refresh must not block release(), the info export or another queue). The copy path also
+# refreshes on COMPUTE and COPY queues. Each mutant removes one guarantee in the DLL and must fail its case.
 add_executable(linear_buffer_backing_check tests/linear_buffer_backing_check.cpp)
 target_include_directories(linear_buffer_backing_check PRIVATE tests)
 target_compile_features(linear_buffer_backing_check PRIVATE cxx_std_17)
 target_link_libraries(linear_buffer_backing_check PRIVATE xmem_shim d3d12_xs_shim d3d12 dxgi d3dcompiler)
 foreach(adapter IN ITEMS warp hardware)
-    foreach(path IN ITEMS default share copy refusal untracked stale)
+    foreach(path IN ITEMS default share copy refusal untracked stale contention)
         add_test(NAME linear_buffer_backing_${path}_${adapter} COMMAND linear_buffer_backing_check ${adapter} ${path})
         set_tests_properties(linear_buffer_backing_${path}_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     endforeach()
 endforeach()
 foreach(control IN ITEMS copy:skip_refresh copy:reuse_early copy:copy_gpu_writes refusal:ignore_feature
-        copy:refusal_silent)
+        copy:refusal_silent contention:hold_lock)
     string(REPLACE ":" ";" parts "${control}")
     list(GET parts 0 path)
     list(GET parts 1 mutant)

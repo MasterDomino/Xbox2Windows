@@ -17,6 +17,8 @@
 //              the copy cannot keep its lifetime guarantee: slot 133 keeps the default backing
 //   stale      X2W_D3D12_LINEAR_BUFFERS=copy with X2W_TEST_LINEAR_REFRESH_FAIL=3: staging requests 2,
 //              5, 8 ... fail, so one refresh per pool cannot be staged
+//   contention X2W_D3D12_LINEAR_BUFFERS=copy with X2W_TEST_LINEAR_STAGING_LIMIT=1: one staging buffer,
+//              so a refresh waits for the fence of the submission that holds it
 //
 // Where the new path cannot keep its guarantees (a GPU-written use that is not shared, no submit
 // fence), slot 133 must keep the default backing and return what it returns with the switch off:
@@ -56,6 +58,13 @@
 //   split (share only) a buffer across two XMem views: sharing is refused with E_INVALIDARG, decided
 //        before any D3D12 call, and the buffer is copied; case a must still read B.
 //   gate (refusal only) no heap was opened: D3D12_FEATURE_EXISTING_HEAPS gates sharing before any open.
+//   q.comp, q.copy (copy only) the buffer is read by a list on a COMPUTE queue (a dispatch) and on a
+//        COPY queue (CopyBufferRegion) submitted through those queues' wrappers: the refresh runs on
+//        that queue, the first submission reads B, and a 16-word change then copies 64 bytes.
+//   contention (contention only) a second queue, a release() and the info export while a submission
+//        waits for the only staging buffer, which a gate-held submission still reads: all three must
+//        finish while the wait is still under way. After the gate opens the waiting refresh takes that
+//        buffer again (none is created), and each submission reads its own bytes.
 //   pin  (share, XMem; measured, not asserted) a heap opened from an XMem view and a buffer placed on
 //        it, then XMem's unmap of those pages, while they live and after their release.
 //
@@ -65,7 +74,8 @@
 //
 // --mutate <name> sets X2W_TEST_LINEAR_BUFFER_MUTANT, which removes one guarantee inside d3d12_xs.dll:
 //   skip-refresh (copy) case a, reuse-early (copy) case c, copy-gpu-writes (copy) case b,
-//   ignore-feature (refusal) case gate, refusal-silent (copy) case b (the kept default is not reported).
+//   ignore-feature (refusal) case gate, refusal-silent (copy) case b (the kept default is not reported),
+//   hold-lock (contention) case contention (the wait keeps the backing's lock held).
 // The run then exits 1 only if every targeted case failed, else 0 (negative controls, WILL_FAIL).
 // X2W_TEST_DEBUG_LAYER=1 enables the D3D12 debug layer; any stored error fails the run.
 // Returns 0 on pass, 1 on failure, 77 without the adapter, or on the share path when the adapter
@@ -77,10 +87,13 @@
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "xmem_test_device.h"
@@ -232,7 +245,7 @@ std::string pointer_text(const void* p)
     return text;
 }
 
-enum class Path { default_backing, share, copy, refusal, untracked, stale };
+enum class Path { default_backing, share, copy, refusal, untracked, stale, contention };
 const char* path_name(Path p)
 {
     switch (p) {
@@ -241,7 +254,8 @@ const char* path_name(Path p)
     case Path::copy: return "copy";
     case Path::refusal: return "refusal";
     case Path::untracked: return "untracked";
-    default: return "stale";
+    case Path::stale: return "stale";
+    default: return "contention";
     }
 }
 
@@ -318,6 +332,22 @@ struct Pool {
 
 // ---- Device, the wrapper's queue, and recording ----
 
+// Another queue of the title's device: its wrapper, the desktop queue behind it and a completion fence.
+struct Lane {
+    ComPtr<ID3D12CommandQueue> guest, native;
+    ComPtr<ID3D12Fence> fence;
+    UINT64 value = 0;
+};
+
+bool wait_fence(ID3D12Fence* fence, UINT64 value)
+{
+    if (fence->GetCompletedValue() >= value) return true;
+    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    const bool ok = event && SUCCEEDED(fence->SetEventOnCompletion(value, event)) && WaitForSingleObject(event, 20000) == WAIT_OBJECT_0;
+    if (event) CloseHandle(event);
+    return ok;
+}
+
 struct Gpu {
     ComPtr<ID3D12Device> desktop, guest;
     ComPtr<ID3D12CommandQueue> guest_queue, queue;  // the wrapper and the desktop queue behind it
@@ -389,6 +419,13 @@ struct Gpu {
         if (gate_armed) gate->Signal(gate_value);
         gate_armed = false;
     }
+    bool lane(Lane& out, D3D12_COMMAND_LIST_TYPE type)
+    {
+        const D3D12_COMMAND_QUEUE_DESC desc{type};
+        if (FAILED(guest->CreateCommandQueue(&desc, IID_PPV_ARGS(&out.guest)))) return false;
+        out.native = underlying<ID3D12CommandQueue>(desktop.Get(), guest.Get(), out.guest.Get());
+        return out.native && SUCCEEDED(desktop->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&out.fence)));
+    }
     bool wait(UINT64 value)
     {
         if (done->GetCompletedValue() >= value) return true;
@@ -433,12 +470,12 @@ struct TitleList {
     ComPtr<ID3D12GraphicsCommandList> native;
     Gpu* gpu = nullptr;
 
-    bool begin(Gpu& g)
+    bool begin(Gpu& g, D3D12_COMMAND_LIST_TYPE type = D3D12_COMMAND_LIST_TYPE_DIRECT)
     {
         gpu = &g;
-        if (FAILED(g.guest->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)))) return false;
+        if (FAILED(g.guest->CreateCommandAllocator(type, IID_PPV_ARGS(&allocator)))) return false;
         using CreateList = HRESULT(WINAPI*)(IUnknown*, const void*, IUnknown*, IUnknown*, REFIID, void**);
-        const UINT list_desc[]{D3D12_COMMAND_LIST_TYPE_DIRECT, 2, 1, 0};
+        const UINT list_desc[]{static_cast<UINT>(type), 2, 1, 0};
         auto* create = reinterpret_cast<CreateList>((*reinterpret_cast<void***>(g.guest.Get()))[73]);
         if (FAILED(create(g.guest.Get(), list_desc, allocator.Get(), nullptr, __uuidof(ID3D12GraphicsCommandList),
                           reinterpret_cast<void**>(list.GetAddressOf()))))
@@ -474,6 +511,12 @@ struct TitleList {
         native->CopyBufferRegion(gpu->readback.Get(), at, gpu->output.Get(), at, region_bytes);
         barrier(gpu->output.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
     }
+    // For a COPY list: buffer[r0 .. r0 + 4 KiB) -> readback slot, unchanged (the buffer is promoted
+    // from COMMON to COPY_SOURCE implicitly).
+    void read_copy(ID3D12Resource* buffer, UINT slot = 0)
+    {
+        native->CopyBufferRegion(gpu->readback.Get(), slot * region_bytes, buffer, r0, region_bytes);
+    }
     // buffer[r1 + 4i] = G[i] ^ key.
     void write_g(ID3D12Resource* buffer)
     {
@@ -490,6 +533,14 @@ struct TitleList {
         invoke(gpu->guest_queue.Get(), 10, 1, arg(lists));
         gpu->queue->Signal(gpu->done.Get(), ++gpu->submitted);
         return gpu->submitted;
+    }
+    // Through another queue's wrapper; the lane's fence completes it.
+    UINT64 submit_on(Lane& lane)
+    {
+        void* lists[] = {list.Get()};
+        invoke(lane.guest.Get(), 10, 1, arg(lists));
+        lane.native->Signal(lane.fence.Get(), ++lane.value);
+        return lane.value;
     }
     // Past the wrapper: the desktop list on the desktop queue (a submission without the refresh).
     UINT64 submit_bypassing()
@@ -871,6 +922,130 @@ struct Run {
                 (p.info.stale ? ", STILL STALE" : ", stale cleared"));
     }
 
+    // q.comp, q.copy: the refresh on a COMPUTE and a COPY queue (implicit COMMON -> COPY_DEST there too).
+    void case_queues(Pool& pool)
+    {
+        for (const auto type : {D3D12_COMMAND_LIST_TYPE_COMPUTE, D3D12_COMMAND_LIST_TYPE_COPY}) {
+            const bool compute = type == D3D12_COMMAND_LIST_TYPE_COMPUTE;
+            const char* name = compute ? "q.comp" : "q.copy";
+            Lane lane;
+            Memory memory;
+            if (!gpu.lane(lane, type)) return row(pool, name, false, "queue wrapper not created");
+            if (!pool.allocate(memory, A)) return row(pool, name, false, "allocation failed");
+            Placed p = place(gpu, memory.buffer(), false);
+            TitleList first, second;
+            if (FAILED(p.hr) || !p.backing || !first.begin(gpu, type) || !second.begin(gpu, type))
+                return row(pool, name, false, "slot 133 -> " + hex(p.hr) + " or list creation failed");
+            const std::uint32_t mask = compute ? key : 0;
+            compute ? first.read(p.backing.Get()) : first.read_copy(p.backing.Get());
+            if (!first.close()) return row(pool, name, false, "Close failed");
+            write(memory.buffer(), r0, B, words);
+            if (!wait_fence(lane.fence.Get(), first.submit_on(lane))) return row(pool, name, false, "fence timeout");
+            const Tally t1 = tally(gpu.read_output().data(), r0 / 4, mask);
+            refresh_info(p);
+            const UINT64 after_first = p.info.bytes_copied;
+            compute ? second.read(p.backing.Get()) : second.read_copy(p.backing.Get());
+            second.close();
+            write(memory.buffer(), r0 + 64 * 4, E, 16);
+            if (!wait_fence(lane.fence.Get(), second.submit_on(lane))) return row(pool, name, false, "fence timeout");
+            const Tally t2 = tally(gpu.read_output().data(), r0 / 4, mask);
+            refresh_info(p);
+            const UINT64 delta = p.info.bytes_copied - after_first;
+            const bool pass = p.linear && p.info.path == 2 && !p.info.stale && p.info.refresh_failures == 0 && t1.count[B] == words &&
+                              after_first == buffer_bytes && t2.count[E] == 16 && t2.count[B] == words - 16 && delta == 64;
+            row(pool, name, pass,
+                std::string(compute ? "COMPUTE queue, dispatch read: " : "COPY queue, CopyBufferRegion read: ") + "first submission " +
+                    t1.text() + " (" + std::to_string(after_first) + " bytes refreshed), then " + t2.text() + " (" +
+                    std::to_string(delta) + " bytes)" + (p.info.stale ? ", STALE" : ""));
+        }
+    }
+
+    // contention: nothing waits behind a submission that waits for the only staging buffer.
+    void case_contention(Pool& pool)
+    {
+        using clock = std::chrono::steady_clock;
+        const auto ms = [](clock::duration d) { return static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(d).count()); };
+        Lane second;
+        Memory mx, mw;
+        if (!gpu.lane(second, D3D12_COMMAND_LIST_TYPE_DIRECT) || !pool.allocate(mx, A))
+            return row(pool, "contention", false, "setup failed");
+        Placed x = place(gpu, mx.buffer(), false);
+        TitleList l0;
+        if (FAILED(x.hr) || !x.backing || !l0.begin(gpu)) return row(pool, "contention", false, "slot 133 -> " + hex(x.hr));
+        l0.read(x.backing.Get());
+        l0.close();
+        if (!gpu.wait(l0.submit())) return row(pool, "contention", false, "fence timeout");  // X uploaded: the staging buffer exists
+        if (!pool.allocate(mw, D)) return row(pool, "contention", false, "allocation failed");
+        Placed w = place(gpu, mw.buffer(), false);
+        TitleList lw;
+        if (FAILED(w.hr) || !w.backing || !lw.begin(gpu)) return row(pool, "contention", false, "slot 133 -> " + hex(w.hr));
+        lw.read(w.backing.Get());
+        lw.close();
+        if (!wait_fence(second.fence.Get(), lw.submit_on(second))) return row(pool, "contention", false, "fence timeout");
+        const X2wLinearBufferTotals before = totals();
+
+        // S1 reads B and is held on the gate; its refresh holds the only staging buffer.
+        gpu.hold();
+        write(mx.buffer(), r0, B, words);
+        TitleList s1, s2, probe;
+        if (!s1.begin(gpu) || !s2.begin(gpu) || !probe.begin(gpu)) return row(pool, "contention", false, "list");
+        s1.read(x.backing.Get(), 1);
+        s1.close();
+        s1.submit();
+        // S2's refresh (C) must wait for S1's fence: on another thread.
+        write(mx.buffer(), r0, C, words);
+        s2.read(x.backing.Get(), 2);
+        s2.close();
+        std::atomic<bool> done{false};
+        UINT64 s2_value = 0;
+        const auto t1_start = clock::now();
+        clock::duration t1_time{};
+        std::thread waiter([&] {
+            s2_value = s2.submit();
+            t1_time = clock::now() - t1_start;
+            done = true;
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        const bool waiting_before = !done;
+        // Probes, each through mutex_: the info export, the title's release of X, a submission on another queue.
+        auto* x_wrapper = x.wrapper.Get();
+        X2wLinearBufferInfo probe_info{};
+        auto t = clock::now();
+        x2w_d3d12_linear_buffer_info(w.wrapper.Get(), &probe_info);
+        const auto info_time = clock::now() - t;
+        t = clock::now();
+        x.wrapper.Reset();  // release(): retire X
+        const auto release_time = clock::now() - t;
+        probe.read(w.backing.Get(), 3);
+        probe.close();
+        t = clock::now();
+        const bool probe_done = wait_fence(second.fence.Get(), probe.submit_on(second));
+        const auto submit_time = clock::now() - t;
+        const bool waiting_after = !done;
+        const Tally w_read = tally(gpu.read_output(3).data(), r0 / 4, key);
+        gpu.open_gate();
+        waiter.join();
+        if (!gpu.wait(s2_value)) return row(pool, "contention", false, "fence timeout after the gate");
+        const Tally r1 = tally(gpu.read_output(1).data(), r0 / 4, key), r2 = tally(gpu.read_output(2).data(), r0 / 4, key);
+        X2wLinearBufferInfo xi{};
+        x2w_d3d12_linear_buffer_info(x_wrapper, &xi);
+        const X2wLinearBufferTotals after = totals();
+        const bool reused = after.staging_created == before.staging_created && after.staging_reused >= before.staging_reused + 2;
+        const bool pass = waiting_before && waiting_after && probe_done && w_read.count[D] == words && r1.count[B] == words &&
+                          r2.count[C] == words && !xi.stale && xi.refresh_failures == 0 && reused &&
+                          ms(t1_time) >= ms(info_time + release_time + submit_time);
+        char text[400];
+        std::snprintf(text, sizeof(text),
+                      "while S2's refresh waited (%s before, %s after the probes): info %lld ms, release %lld ms, other-queue submit "
+                      "%lld ms (read %s); S2 returned after %lld ms; S1 read %s, S2 read %s; staging created %llu -> %llu, "
+                      "refresh failures %llu",
+                      waiting_before ? "waiting" : "NOT WAITING", waiting_after ? "waiting" : "DONE", ms(info_time), ms(release_time),
+                      ms(submit_time), w_read.text().c_str(), ms(t1_time), r1.text().c_str(), r2.text().c_str(),
+                      static_cast<unsigned long long>(before.staging_created), static_cast<unsigned long long>(after.staging_created),
+                      static_cast<unsigned long long>(xi.refresh_failures));
+        row(pool, "contention", pass, text);
+    }
+
     void case_d1(Pool& pool)
     {
         if (path == Path::default_backing || path == Path::untracked) return;
@@ -906,7 +1081,7 @@ struct Run {
 int main(int argc, char** argv)
 {
     if (argc < 3) {
-        std::puts("usage: linear_buffer_backing_check <warp|hardware> <default|share|copy|refusal|untracked|stale> [--mutate <name>]");
+        std::puts("usage: linear_buffer_backing_check <warp|hardware> <default|share|copy|refusal|untracked|stale|contention> [--mutate <name>]");
         return 2;
     }
     const bool warp = std::strcmp(argv[1], "warp") == 0;
@@ -919,6 +1094,7 @@ int main(int argc, char** argv)
     else if (p == "refusal") path = Path::refusal;
     else if (p == "untracked") path = Path::untracked;
     else if (p == "stale") path = Path::stale;
+    else if (p == "contention") path = Path::contention;
     else return 2;
     std::string mutant;
     if (argc == 5 && std::strcmp(argv[3], "--mutate") == 0) mutant = argv[4];
@@ -930,10 +1106,11 @@ int main(int argc, char** argv)
     SetEnvironmentVariableW(L"X2W_D3D12_RENDER", L"1");
     SetEnvironmentVariableW(L"X2W_XMEM_SHARED_VIEWS", L"1");
     SetEnvironmentVariableW(L"X2W_D3D12_LINEAR_BUFFERS", path == Path::default_backing ? nullptr
-                                                         : path == Path::copy || path == Path::untracked || path == Path::stale ? L"copy" : L"1");
+                                                         : path == Path::copy || path == Path::untracked || path == Path::stale || path == Path::contention ? L"copy" : L"1");
     SetEnvironmentVariableW(L"X2W_TEST_EXISTING_HEAPS_UNSUPPORTED", path == Path::refusal ? L"1" : nullptr);
     SetEnvironmentVariableW(L"X2W_TEST_SUBMIT_FENCE_FAIL", path == Path::untracked ? L"1" : nullptr);
     SetEnvironmentVariableW(L"X2W_TEST_LINEAR_REFRESH_FAIL", path == Path::stale ? L"3" : nullptr);
+    SetEnvironmentVariableW(L"X2W_TEST_LINEAR_STAGING_LIMIT", path == Path::contention ? L"1" : nullptr);
     SetEnvironmentVariableA("X2W_TEST_LINEAR_BUFFER_MUTANT", mutant.empty() ? nullptr : mutant.c_str());
     {
         // The DLL's log lines go to linear_buffer_backing_<path>_<adapter>[_<mutant>].log next to this executable.
@@ -1009,12 +1186,17 @@ int main(int argc, char** argv)
             run.case_stale(pool);
             continue;
         }
+        if (path == Path::contention) {
+            run.case_contention(pool);
+            continue;
+        }
         run.case_a(pool);
         if (path == Path::share && xmem) run.case_a(pool, true);
         run.case_b(pool, false);
         run.case_c(pool);
         run.case_d1(pool);
         if (path != Path::default_backing) run.case_b(pool, true);
+        if (path == Path::copy) run.case_queues(pool);
         run.probe_view_pin(pool);
     }
     const X2wLinearBufferTotals t = totals();
@@ -1040,7 +1222,7 @@ int main(int argc, char** argv)
             run.row(none, "totals", t.refresh_failures == 2 && t.last_refresh_hr == E_OUTOFMEMORY && t.kept_default == 0,
                     "refresh failures " + std::to_string(t.refresh_failures) + " (expected 2, one per pool), last " + hex(t.last_refresh_hr));
         }
-        if (path != Path::default_backing && path != Path::stale) {
+        if (path != Path::default_backing && path != Path::stale && path != Path::contention) {
             run.row(none, "kept", t.kept_default == run.kept_rows,
                     "totals report " + std::to_string(t.kept_default) + " kept default backings for " + std::to_string(run.kept_rows) +
                         " refused placements, last refusal " + hex(t.last_refusal_hr));
@@ -1064,7 +1246,8 @@ int main(int argc, char** argv)
 
     if (!mutant.empty()) {
         const char* target = mutant == "skip-refresh" ? "a" : mutant == "reuse-early" ? "c" : mutant == "copy-gpu-writes" ? "b"
-                           : mutant == "ignore-feature" ? "gate" : mutant == "refusal-silent" ? "b" : nullptr;
+                           : mutant == "ignore-feature" ? "gate" : mutant == "refusal-silent" ? "b"
+                           : mutant == "hold-lock" ? "contention" : nullptr;
         if (!target) return 2;
         unsigned targeted = 0, failed = 0;
         for (const auto& [name, pass] : run.results)

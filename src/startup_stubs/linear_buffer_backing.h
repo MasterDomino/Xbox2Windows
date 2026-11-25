@@ -67,6 +67,8 @@
 //     copy-gpu-writes  the copy path accepts a GPU-written use
 //     ignore-feature   sharing is attempted although the feature query reports no support
 //     refusal-silent   a kept default backing is not reported (no log text, info or totals)
+//     hold-lock        the wait for a full staging pool keeps mutex_ held (other callers block)
+//   X2W_TEST_LINEAR_STAGING_LIMIT=<n>      the staging pool holds n buffers instead of 256
 //   X2W_TEST_LINEAR_REFRESH_FAIL=<n>       staging requests 2, 2 + n, 2 + 2n, ... fail with E_OUTOFMEMORY
 
 #include <windows.h>
@@ -222,7 +224,7 @@ public:
                                                  nullptr, IID_PPV_ARGS(&resource));
             if (SUCCEEDED(hr)) {
                 try {
-                    record.copy = std::make_unique<Copied>();
+                    record.copy = std::make_shared<Copied>();
                     record.copy->title = static_cast<const unsigned char*>(address);
                     record.copy->bytes = width;
                     if (linear_detail::mutant("skip-refresh")) {
@@ -312,100 +314,121 @@ public:
     // Before the title's lists are executed on queue (the contract's copy point): records and
     // executes the refresh of every live copied buffer whose title bytes changed. Nothing here holds
     // the submission back: a buffer whose refresh fails keeps its last upload and is marked stale.
+    //
+    // mutex_ is held only to read and publish state: the work is snapshotted under it, then staging
+    // is taken (and, with the pool full, its fence waited for), filled, recorded and executed without
+    // it, and the results are published under it again. A release() or another queue's submission
+    // therefore never waits behind a fence wait or ExecuteCommandLists here.
     void before_submit(ID3D12CommandQueue* queue, Submission& submission)
     {
-        std::lock_guard lock(mutex_);
-        ++totals_.submissions;
-        bool any = false;
-        for (auto& [resource, record] : records_) any |= record.copy && record.copy->live;
-        if (!any) return;
-        QueueState* state = nullptr;
-        const HRESULT state_hr = queue_state(queue, &state);
-        struct Op {
+        struct Work {
             ID3D12Resource* dest;
-            Copied* copy;
-            UINT64 offset;
-            Staging* source;
-            UINT64 bytes;
+            std::shared_ptr<Copied> copy;
+            const unsigned char* source;
+            UINT64 offset, bytes;
+            Staging* staging = nullptr;
+            HRESULT hr = S_OK;
         };
-        std::vector<Op> ops;
-        for (auto& [resource, record] : records_) {
-            Copied* copy = record.copy.get();
-            if (!copy || !copy->live) continue;
-            const std::size_t bytes = static_cast<std::size_t>(copy->bytes);
-            const unsigned char* source = copy->bound.empty() ? copy->title : copy->bound.data();
-            if (copy->bound.empty() && x2w_local::probe_readable(reinterpret_cast<std::uintptr_t>(source), bytes) < bytes) {
-                if (x2w_local::first_calls(unreadable_logged_, 4))
-                    x2w_local::logf("x2w-d3d12 linear buffer %p: title memory %p is no longer readable; its backing "
-                                    "keeps the last upload", static_cast<void*>(resource), static_cast<const void*>(source));
-                ++totals_.unreadable;
-                continue;
-            }
-            std::size_t first = 0, last = bytes;
-            if (copy->uploaded.size() == bytes) {
-                if (std::memcmp(copy->uploaded.data(), source, bytes) == 0) {
-                    copy->stale = false;
+        std::vector<Work> work;
+        QueueState* state = nullptr;
+        HRESULT state_hr = S_OK;
+        {
+            std::lock_guard lock(mutex_);
+            ++totals_.submissions;
+            bool any = false;
+            for (auto& [resource, record] : records_) any |= record.copy && record.copy->live;
+            if (!any) return;
+            state_hr = queue_state(queue, &state);
+            for (auto& [resource, record] : records_) {
+                const std::shared_ptr<Copied>& copy = record.copy;
+                if (!copy || !copy->live) continue;
+                const std::size_t bytes = static_cast<std::size_t>(copy->bytes);
+                const unsigned char* source = copy->bound.empty() ? copy->title : copy->bound.data();
+                if (copy->bound.empty() && x2w_local::probe_readable(reinterpret_cast<std::uintptr_t>(source), bytes) < bytes) {
+                    if (x2w_local::first_calls(unreadable_logged_, 4))
+                        x2w_local::logf("x2w-d3d12 linear buffer %p: title memory %p is no longer readable; its backing "
+                                        "keeps the last upload", static_cast<void*>(resource), static_cast<const void*>(source));
+                    ++totals_.unreadable;
                     continue;
                 }
-                while (first < bytes && copy->uploaded[first] == source[first]) ++first;
-                while (last > first && copy->uploaded[last - 1] == source[last - 1]) --last;
-                first &= ~std::size_t{3};
-                last = (std::min)(bytes, (last + 3) & ~std::size_t{3});
-            }
-            const UINT64 span = last - first;
-            Staging* staging = nullptr;
-            HRESULT hr = state_hr;
-            if (SUCCEEDED(hr)) hr = take_staging(queue, span, submission, &staging);
-            if (SUCCEEDED(hr)) {
+                std::size_t first = 0, last = bytes;
+                if (copy->uploaded.size() == bytes) {
+                    if (std::memcmp(copy->uploaded.data(), source, bytes) == 0) {
+                        copy->stale = false;
+                        continue;
+                    }
+                    while (first < bytes && copy->uploaded[first] == source[first]) ++first;
+                    while (last > first && copy->uploaded[last - 1] == source[last - 1]) --last;
+                    first &= ~std::size_t{3};
+                    last = (std::min)(bytes, (last + 3) & ~std::size_t{3});
+                }
                 try {
-                    submission.staging.push_back(staging);
-                    ops.push_back({resource, copy, first, staging, span});
+                    work.push_back({resource, copy, source, first, last - first});
                 } catch (const std::bad_alloc&) {
-                    hr = E_OUTOFMEMORY;
+                    refresh_failed(resource, *copy, E_OUTOFMEMORY);
                 }
             }
+        }
+        if (work.empty()) return;
+
+        // Without the lock: staging (each one ours alone once taken), the copy into it, the list, the queue.
+        std::vector<Staging*> taken;
+        bool any_staged = false;
+        for (Work& w : work) {
+            w.hr = state_hr;
+            if (SUCCEEDED(w.hr)) w.hr = acquire_staging(queue, w.bytes, taken, &w.staging);
+            if (FAILED(w.hr)) continue;
+            taken.push_back(w.staging);
+            std::memcpy(w.staging->mapped, w.source + w.offset, static_cast<std::size_t>(w.bytes));
+            any_staged = true;
+        }
+        RefreshList* list = nullptr;
+        HRESULT list_hr = S_OK;
+        if (any_staged) {
+            list_hr = acquire_list(queue, *state, &list);
+            if (SUCCEEDED(list_hr)) {
+                // Buffers rest in COMMON: each copy promotes its destination to COPY_DEST (on a direct,
+                // compute or copy queue alike), and it decays to COMMON again when this
+                // ExecuteCommandLists completes, before the title's lists use it.
+                for (const Work& w : work)
+                    if (SUCCEEDED(w.hr)) list->list->CopyBufferRegion(w.dest, w.offset, w.staging->buffer, 0, w.bytes);
+                list_hr = list->list->Close();
+            }
+            if (SUCCEEDED(list_hr)) {
+                ID3D12CommandList* lists[] = {list->list};
+                queue->ExecuteCommandLists(1, lists);
+            }
+        }
+
+        // Publish under the lock.
+        std::lock_guard lock(mutex_);
+        if (list && FAILED(list_hr)) list->value = 0;
+        for (Work& w : work) {
+            const HRESULT hr = FAILED(w.hr) ? w.hr : list_hr;
             if (FAILED(hr)) {
-                if (staging && (submission.staging.empty() || submission.staging.back() != staging)) staging->value = 0;
-                refresh_failed(resource, *copy, hr);
+                if (w.staging) w.staging->value = 0;  // never reached the GPU
+                refresh_failed(w.dest, *w.copy, hr);
                 continue;
             }
-            std::memcpy(staging->mapped, source + first, static_cast<std::size_t>(span));
-        }
-        if (ops.empty()) return;
-        RefreshList* list = nullptr;
-        HRESULT hr = take_list(queue, *state, &list);
-        if (SUCCEEDED(hr)) {
-            // Buffers rest in COMMON: each copy promotes its destination to COPY_DEST, and it decays to
-            // COMMON again when this ExecuteCommandLists completes, before the title's lists use it.
-            for (const Op& op : ops) list->list->CopyBufferRegion(op.dest, op.offset, op.source->buffer, 0, op.bytes);
-            hr = list->list->Close();
-            if (FAILED(hr)) list->value = 0;
-        }
-        if (FAILED(hr)) {
-            for (Staging* staging : submission.staging) staging->value = 0;
-            submission = {};
-            for (const Op& op : ops) refresh_failed(op.dest, *op.copy, hr);
-            return;
-        }
-        ID3D12CommandList* lists[] = {list->list};
-        queue->ExecuteCommandLists(1, lists);
-        submission.list = list;
-        for (const Op& op : ops) {
-            Copied& copy = *op.copy;
-            // The backing now holds these bytes (the staging buffer keeps them until its fence).
-            try {
-                if (copy.uploaded.size() != copy.bytes) copy.uploaded.assign(static_cast<std::size_t>(copy.bytes), 0);
-                std::memcpy(copy.uploaded.data() + op.offset, op.source->mapped, static_cast<std::size_t>(op.bytes));
-            } catch (const std::bad_alloc&) {
-                copy.uploaded.clear();  // the next submission copies the whole buffer again
+            submission.staging.push_back(w.staging);
+            Copied& copy = *w.copy;
+            if (copy.live) {
+                // The backing now holds these bytes (the staging buffer keeps them until its fence).
+                try {
+                    if (copy.uploaded.size() != copy.bytes) copy.uploaded.assign(static_cast<std::size_t>(copy.bytes), 0);
+                    std::memcpy(copy.uploaded.data() + w.offset, w.staging->mapped, static_cast<std::size_t>(w.bytes));
+                } catch (const std::bad_alloc&) {
+                    copy.uploaded.clear();  // the next submission copies the whole buffer again
+                }
             }
             copy.stale = false;
             ++copy.refreshes;
-            copy.bytes_copied += op.bytes;
-            copy.last_staging = op.source->id;
+            copy.bytes_copied += w.bytes;
+            copy.last_staging = w.staging->id;
             ++totals_.refreshes;
-            totals_.bytes_copied += op.bytes;
+            totals_.bytes_copied += w.bytes;
         }
+        if (SUCCEEDED(list_hr) && list) submission.list = list;
     }
 
     // After the title's lists were executed on queue: the fence value that completes them also releases
@@ -471,7 +494,7 @@ private:
     };
     struct Record {
         X2wLinearBufferInfo info{};
-        std::unique_ptr<Copied> copy;
+        std::shared_ptr<Copied> copy;  // shared: a submission's snapshot outlives a discard
     };
     struct Staging {
         ID3D12Resource* buffer = nullptr;
@@ -495,7 +518,19 @@ private:
         ID3D12Heap* heap;
         UINT64 generation, bytes;
     };
-    static constexpr std::size_t staging_limit = 256;
+    // 256 staging buffers; X2W_TEST_LINEAR_STAGING_LIMIT=<n> (fixtures) lowers it, to make the pool fill.
+    static std::size_t staging_limit()
+    {
+        static const std::size_t limit = [] {
+            const DWORD saved = GetLastError();
+            char value[16]{};
+            const DWORD n = GetEnvironmentVariableA("X2W_TEST_LINEAR_STAGING_LIMIT", value, sizeof(value));
+            SetLastError(saved);
+            const unsigned long parsed = n && n < sizeof(value) ? std::strtoul(value, nullptr, 10) : 0;
+            return parsed ? static_cast<std::size_t>(parsed) : std::size_t{256};
+        }();
+        return limit;
+    }
 
     HRESULT feature(ID3D12Device* device)
     {
@@ -594,80 +629,124 @@ private:
                (staging.value != ~UINT64{0} && staging.fence && staging.fence->GetCompletedValue() >= staging.value);
     }
 
-    HRESULT take_staging(ID3D12CommandQueue* queue, UINT64 bytes, const Submission& submission, Staging** out)
+    // Takes a staging buffer of at least `bytes` that no submission still reads, for this submission
+    // alone (`taken` are the ones it already holds). Called without mutex_: the lock is taken only to
+    // choose or publish a buffer; creating one and waiting for a fence happen outside it.
+    HRESULT acquire_staging(ID3D12CommandQueue* queue, UINT64 bytes, const std::vector<Staging*>& taken, Staging** out)
     {
-        if (const unsigned period = linear_detail::refresh_fault_period();
-            period && ++staging_requests_ % period == 2 % period)
-            return E_OUTOFMEMORY;  // fixture fault (X2W_TEST_LINEAR_REFRESH_FAIL)
         const bool early = linear_detail::mutant("reuse-early");
+        {
+            std::lock_guard lock(mutex_);
+            if (const unsigned period = linear_detail::refresh_fault_period();
+                period && ++staging_requests_ % period == 2 % period)
+                return E_OUTOFMEMORY;  // fixture fault (X2W_TEST_LINEAR_REFRESH_FAIL)
+        }
         for (int attempt = 0; attempt < 2; ++attempt) {
-            Staging* best = nullptr;
-            for (const auto& staging : staging_) {
-                if (staging->bytes < bytes || (!early && !complete(*staging))) continue;
-                const auto& taken = submission.staging;
-                if (std::find(taken.begin(), taken.end(), staging.get()) != taken.end()) continue;
-                // The reuse-early mutant takes the most recently used buffer, in flight or not.
-                if (!best || (early ? staging->id > best->id : staging->bytes < best->bytes)) best = staging.get();
+            bool create = false;
+            ID3D12Fence* fence = nullptr;
+            UINT64 value = 0;
+            {
+                std::lock_guard lock(mutex_);
+                Staging* best = nullptr;
+                for (const auto& staging : staging_) {
+                    if (staging->bytes < bytes || (!early && !complete(*staging))) continue;
+                    if (std::find(taken.begin(), taken.end(), staging.get()) != taken.end()) continue;
+                    // The reuse-early mutant takes the most recently used buffer, in flight or not.
+                    if (!best || (early ? staging->id > best->id : staging->bytes < best->bytes)) best = staging.get();
+                }
+                if (best) {
+                    ++totals_.staging_reused;
+                    best->value = ~UINT64{0};
+                    *out = best;
+                    return S_OK;
+                }
+                if (staging_.size() + creating_ < staging_limit()) {
+                    ++creating_;
+                    create = true;
+                } else {
+                    // The pool is full of buffers in flight: the oldest with a signalled value is waited for.
+                    const Staging* oldest = nullptr;
+                    for (const auto& staging : staging_)
+                        if (staging->value != ~UINT64{0} && staging->fence && (!oldest || staging->value < oldest->value))
+                            oldest = staging.get();
+                    if (oldest) {
+                        fence = oldest->fence;
+                        value = oldest->value;
+                    }
+                }
             }
-            if (best) {
-                ++totals_.staging_reused;
-                best->value = ~UINT64{0};
-                *out = best;
-                return S_OK;
-            }
-            if (staging_.size() < staging_limit) break;
-            // The pool is full of buffers in flight: wait (once, bounded) for the oldest.
-            Staging* oldest = nullptr;
-            for (const auto& staging : staging_)
-                if (staging->value != ~UINT64{0} && staging->fence && (!oldest || staging->value < oldest->value))
-                    oldest = staging.get();
-            HANDLE event = oldest ? CreateEventW(nullptr, FALSE, FALSE, nullptr) : nullptr;
-            const bool reached = event && SUCCEEDED(oldest->fence->SetEventOnCompletion(oldest->value, event)) &&
+            if (create) return create_staging(queue, bytes, out);
+            if (!fence || attempt) break;
+            // The hold-lock mutant waits with mutex_ held, as before the review: other callers block.
+            std::unique_lock<std::mutex> held;
+            if (linear_detail::mutant("hold-lock")) held = std::unique_lock<std::mutex>(mutex_);
+            HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            const bool reached = event && SUCCEEDED(fence->SetEventOnCompletion(value, event)) &&
                                  WaitForSingleObject(event, 5000) == WAIT_OBJECT_0;
             if (event) CloseHandle(event);
             if (!reached) return DXGI_ERROR_WAS_STILL_DRAWING;
         }
-        if (staging_.size() >= staging_limit) return DXGI_ERROR_WAS_STILL_DRAWING;
+        return DXGI_ERROR_WAS_STILL_DRAWING;
+    }
+
+    // Called without mutex_ after acquire_staging reserved a place in the pool (creating_).
+    HRESULT create_staging(ID3D12CommandQueue* queue, UINT64 bytes, Staging** out)
+    {
+        auto staging = std::make_unique<Staging>();
         ID3D12Device* device = nullptr;
         HRESULT hr = queue->GetDevice(IID_PPV_ARGS(&device));
-        if (FAILED(hr)) return hr;
-        const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_UPLOAD};
-        const UINT64 rounded = (bytes + 0xFFFF) & ~UINT64{0xFFFF};
-        const UINT64 size = rounded ? rounded : 0x10000;
-        const auto desc = linear_detail::buffer(size, D3D12_RESOURCE_FLAG_NONE);
-        auto staging = std::make_unique<Staging>();
-        hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                                             IID_PPV_ARGS(&staging->buffer));
-        device->Release();
-        if (FAILED(hr)) return hr;
+        if (SUCCEEDED(hr)) {
+            const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_UPLOAD};
+            const UINT64 rounded = (bytes + 0xFFFF) & ~UINT64{0xFFFF};
+            const UINT64 size = rounded ? rounded : 0x10000;
+            const auto desc = linear_detail::buffer(size, D3D12_RESOURCE_FLAG_NONE);
+            hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                 IID_PPV_ARGS(&staging->buffer));
+            device->Release();
+            staging->bytes = size;
+        }
         void* mapped = nullptr;
         const D3D12_RANGE none{0, 0};
-        hr = staging->buffer->Map(0, &none, &mapped);
+        if (SUCCEEDED(hr)) hr = staging->buffer->Map(0, &none, &mapped);
+        std::lock_guard lock(mutex_);
+        --creating_;
         if (FAILED(hr)) {
-            staging->buffer->Release();
+            if (staging->buffer) staging->buffer->Release();
             return hr;
         }
         staging->mapped = static_cast<unsigned char*>(mapped);
-        staging->bytes = size;
         staging->id = ++staging_ids_;
         staging->value = ~UINT64{0};
+        try {
+            staging_.push_back(std::move(staging));
+        } catch (const std::bad_alloc&) {
+            return E_OUTOFMEMORY;  // the unique_ptr releases nothing: the buffer is leaked, not reused
+        }
         ++totals_.staging_created;
-        *out = staging.get();
-        staging_.push_back(std::move(staging));
+        *out = staging_.back().get();
         return S_OK;
     }
 
-    HRESULT take_list(ID3D12CommandQueue* queue, QueueState& state, RefreshList** out)
+    // A refresh list for queue whose last use has completed, or a new one, reset and ours alone.
+    // Called without mutex_; the lock covers only the choice and the pool.
+    HRESULT acquire_list(ID3D12CommandQueue* queue, QueueState& state, RefreshList** out)
     {
-        const UINT64 completed = state.fence->GetCompletedValue();
-        for (const auto& list : state.lists) {
-            if (list->value == ~UINT64{0} || list->value > completed) continue;
-            HRESULT hr = list->allocator->Reset();
-            if (SUCCEEDED(hr)) hr = list->list->Reset(list->allocator, nullptr);
-            if (FAILED(hr)) return hr;
-            list->value = ~UINT64{0};
-            *out = list.get();
-            return S_OK;
+        RefreshList* found = nullptr;
+        {
+            std::lock_guard lock(mutex_);
+            const UINT64 completed = state.fence->GetCompletedValue();
+            for (const auto& list : state.lists) {
+                if (list->value == ~UINT64{0} || list->value > completed) continue;
+                list->value = ~UINT64{0};
+                found = list.get();
+                break;
+            }
+        }
+        if (found) {
+            HRESULT hr = found->allocator->Reset();
+            if (SUCCEEDED(hr)) hr = found->list->Reset(found->allocator, nullptr);
+            *out = found;  // on failure the caller frees it again under the lock
+            return hr;
         }
         ID3D12Device* device = nullptr;
         HRESULT hr = queue->GetDevice(IID_PPV_ARGS(&device));
@@ -679,12 +758,18 @@ private:
             hr = device->CreateCommandList(0, type, list->allocator, nullptr, IID_PPV_ARGS(&list->list));
         device->Release();
         if (FAILED(hr)) {
+            if (list->list) list->list->Release();
             if (list->allocator) list->allocator->Release();
             return hr;
         }
         list->value = ~UINT64{0};
-        *out = list.get();
-        state.lists.push_back(std::move(list));
+        std::lock_guard lock(mutex_);
+        try {
+            state.lists.push_back(std::move(list));
+        } catch (const std::bad_alloc&) {
+            return E_OUTOFMEMORY;
+        }
+        *out = state.lists.back().get();
         return S_OK;
     }
 
@@ -711,6 +796,7 @@ private:
     ID3D12Device* fence_check_device_ = nullptr;
     HRESULT fence_check_hr_ = S_OK;
     UINT64 generation_ = 0, staging_ids_ = 0, staging_requests_ = 0;
+    std::size_t creating_ = 0;  // staging buffers being created outside the lock
     X2wLinearBufferTotals totals_{};
     volatile LONG unreadable_logged_ = 0, signal_logged_ = 0, refresh_logged_ = 0;
 };

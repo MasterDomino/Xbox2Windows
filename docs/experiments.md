@@ -9681,8 +9681,10 @@ A title run motivated the fallback. An earlier revision returned the refusal fro
 | off | `default` only: none of the linear-buffer code ran. |
 | kept | every path with refusals: the totals count as many kept default backings as the run refused. |
 | stale | `stale` only: a refreshed submission of A, then the CPU writes B and the refresh fails. The submission must still run and complete and read A (the last upload). The buffer must be reported stale with `E_OUTOFMEMORY` in its info and the log. The next submission must read B and clear it. |
+| q.comp, q.copy | `copy` only: the buffer is read on a COMPUTE queue (a dispatch) and on a COPY queue (`CopyBufferRegion`), each through its queue wrapper, so the refresh runs on that queue. The first submission must read B with the whole buffer copied, and a 16-word change must then copy 64 bytes. |
+| contention | `contention` only (`=copy` with `X2W_TEST_LINEAR_STAGING_LIMIT=1`): S1 reads X behind a gate and holds the only staging buffer. S2's refresh of X, on another thread, must wait for S1's fence. During that wait, three probes must finish while S2 is still waiting: the info export, the title's release of X, and a submission on a second direct queue. After the gate opens, S2 must take the same staging buffer (none created), and S1 and S2 must read B and C with no refresh failure. |
 
-On Windows 11 build 26300 at `ab9a020c` plus this change, the results were identical on in-box WARP (`1414:008c`, driver 10.0.26100.9818) and an AMD Radeon RX 9070 XT (`1002:7550`, driver 32.0.31044.16), with the debug layer off and on (`X2W_TEST_DEBUG_LAYER=1`, no errors stored). Both adapters report `D3D12_FEATURE_EXISTING_HEAPS`. All six paths pass with no skips. Bytes are those copied from title memory into the backing; HRESULTs are the slot 133 result and the sharing result.
+On Windows 11 build 26300 at `b0669e06` plus this change, the results were identical on in-box WARP (`1414:008c`, driver 10.0.26100.9818) and an AMD Radeon RX 9070 XT (`1002:7550`, driver 32.0.31044.16), with the debug layer off and on (`X2W_TEST_DEBUG_LAYER=1`, no errors stored). Both adapters report `D3D12_FEATURE_EXISTING_HEAPS`. All seven paths pass with no skips. Bytes are those copied from title memory into the backing; HRESULTs are the slot 133 result and the sharing result.
 
 | Path | Pool | Backing | Slot 133 / sharing HRESULT | Bytes copied | Results |
 |---|---|---|---|---|---|
@@ -9694,15 +9696,18 @@ On Windows 11 build 26300 at `ab9a020c` plus this change, the results were ident
 | `refusal` | XMem, private | as `copy` | `S_OK` / `0x887A0004` from the feature gate, no heap opened; b, d2 refusal `0x887A0004` | as `copy` | as `copy`; 4 kept |
 | `untracked` | XMem, private | kept default for every placement | `S_OK`; refusal `0x8007139F` (`E_NOT_VALID_STATE`) for a, `0x887A0004` for b and d2 | 0 | a: XMem reads zero, private B; b and d2: XMem leaves P, private G ^ key (as before); 6 kept |
 | `stale` | XMem, private | copied | `S_OK` / not attempted | 131,072 + 4,096 per pool; the failed refresh copies 0 | the failed submission completes and reads A, stale reported with `0x8007000E`, then B and stale cleared; 2 refresh failures |
+| `copy` (q.comp, q.copy) | XMem, private | copied, refreshed on the COMPUTE or COPY queue | `S_OK` / not attempted | 131,072, then 64 | B in all words, then 16 E; no refresh failure |
+| `contention` | XMem, private | copied, one staging buffer | `S_OK` / not attempted | 540,672 for the run | the probes took 0 ms each while S2 waited about 310 ms for the gate; S1 B, S2 C; staging created 1, no refresh failure |
 
 The run also measures why an XMem view is not shared, and does not assert it. On both adapters `OpenExistingHeapFromAddress` accepts the five-page view and a buffer places at `+0x30000` (`S_OK`). While they live, XMem's unmap of those pages fails with error 87 (`x2w-xmem unmap of 5 page(s) failed`). After they are released it succeeds and the pages are freed. Desktop resources live for the process, so sharing a view would keep the title from ever unmapping or freeing those pages.
 
-Five negative controls each set `X2W_TEST_LINEAR_BUFFER_MUTANT`, which removes one guarantee inside `d3d12_xs.dll`. Each must fail its case in both pools, and on both adapters each does:
+Six negative controls each set `X2W_TEST_LINEAR_BUFFER_MUTANT`, which removes one guarantee inside `d3d12_xs.dll`. Each must fail its case in both pools, and on both adapters each does:
 - `skip-refresh` takes the copy at placement (bind) and never at submit, so a reads A (2 of 2) and d1 reads A through the wrapper.
 - `reuse-early` hands out staging buffers without their fence. All three held refreshes share staging 1, and X, Y and Z all read D (2 of 2).
 - `copy-gpu-writes` lets the copy accept a GPU-written use. b and d2 leave P in the alias (2 of 2).
 - `ignore-feature` opens a heap although the feature query reports no support. gate sees one heap open (1 of 1), and the private buffers are shared.
 - `refusal-silent` keeps the default backing without reporting it. b finds no refusal in the info and no log line (2 of 2), and the kept totals stay at 0.
+- `hold-lock` keeps the backing's lock held while a refresh waits for a staging fence. contention's info probe then blocks for about 4.7 s, until the wait gives up after 5 s. S2 goes stale and reads B (2 of 2).
 
 Run `cmake --build --preset dev --target linear_buffer_backing_check` and `ctest --preset dev --no-tests=error -R '^linear_buffer_backing_' -V`. Set `XBOX2WINDOWS_ADAPTER` to select a hardware adapter and `X2W_TEST_DEBUG_LAYER=1` to enable the debug layer. `linear_buffer_backing_share_hardware` skips (77) on an adapter without existing-heap support; `refusal` covers that case. The controls run on WARP as `WILL_FAIL` tests. Each run writes the DLL's log to `linear_buffer_backing_<path>_<adapter>.log` next to the executable. Not covered: table SRVs of copied buffers in translated draws still take `frame_copy` at record, and root SRVs still take `upload_from_title` at bind; neither reads the slot 133 backing. Shared buffers and their heaps live for the process, so a private range under one cannot be released, as with the default backing. Unsynchronized concurrent writes, textures, render targets, acceleration structures and command-list slot 148 are outside this slice.
 

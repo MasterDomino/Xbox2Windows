@@ -1565,7 +1565,7 @@ extern "C" __declspec(dllexport) void x2w_d3d12_render_target_stats(unsigned* bi
 extern "C" __declspec(dllexport) bool x2w_d3d12_linear_buffer_info(void* resource, X2wLinearBufferInfo* info)
 {
     Wrapper* w = as_wrapper(resource);
-    if (!info || !w || w->own().kind != resource_kind ||
+    if (!info || !w || w->own().kind != resource_kind || !w->own().real ||
         x2w_startup::linear_buffer_mode() == x2w_startup::LinearBufferMode::off)
         return false;
     return linear_buffers().info(static_cast<ID3D12Resource*>(w->own().real), info);
@@ -3531,10 +3531,15 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
     X2W_ZONE("ExecuteCommandLists");
     static LONG calls;
     drain_retired_resources();
+    x2w_startup::LinearBuffers::Submission linear;
     if (render_mode()) {
         // A closed list stays submittable until its next Reset, as on the desktop.
         std::vector<ID3D12CommandList*> ready;
         std::vector<Wrapper*> submitted;
+        auto* queue = static_cast<ID3D12CommandQueue*>(self->own().real);
+        // Before the wrapper's locks: a refresh may wait for a staging fence, and recording must not
+        // wait with it.
+        if (count) linear_refresh(queue, linear);
         // Pin the closed recording and its allocator through submission bookkeeping.
         AcquireSRWLockExclusive(&draw_lock);
         AcquireSRWLockExclusive(&allocator_lock);
@@ -3545,11 +3550,8 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
                 submitted.push_back(w);
             }
         }
-        auto* queue = static_cast<ID3D12CommandQueue*>(self->own().real);
         bool split = false;
         const auto submit = [&](const auto& native_lists, const auto& wrappers) {
-            x2w_startup::LinearBuffers::Submission linear_submission;
-            linear_refresh(queue, linear_submission);
             const UINT ready_count = static_cast<UINT>(native_lists.size());
             red_producers().execute(queue, native_lists, [&] {
                 if (draw_dump_frame()) {
@@ -3560,7 +3562,6 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
                 }
             });
             retire_address_uploads(queue, native_lists);
-            linear_submitted(queue, linear_submission);
             retire_draw_sampler_heaps(queue, native_lists);
             note_submits(queue, wrappers);
             retire_note_submission(queue, wrappers);
@@ -3586,6 +3587,8 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
         } else if (!ready.empty()) {
             submit(ready, submitted);
         }
+        // Also when no list was ready: an executed refresh still needs its fence value.
+        linear_submitted(queue, linear);
         ReleaseSRWLockExclusive(&allocator_lock);
         ReleaseSRWLockExclusive(&draw_lock);
         check_device("CommandQueue execute", 35);
@@ -3599,7 +3602,6 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
     std::vector<ID3D12CommandList*> real(count);
     for (UINT i = 0; i < count; ++i) real[i] = reinterpret_cast<ID3D12CommandList*>(unwrap(reinterpret_cast<u64>(lists[i])));
     auto* queue = static_cast<ID3D12CommandQueue*>(self->own().real);
-    x2w_startup::LinearBuffers::Submission linear;
     linear_refresh(queue, linear);
     queue->ExecuteCommandLists(count, real.data());
     linear_submitted(queue, linear);
