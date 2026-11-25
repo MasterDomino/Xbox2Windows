@@ -2593,7 +2593,9 @@ endforeach()
 # (a waiting refresh must not block release(), the info export or another queue). Refreshes run on an
 # internal copy queue; the copy path also reads on COMPUTE and COPY queues, reads one buffer on two
 # queues after one CPU write (both must see it), and follows a title-owned cross-queue fence without
-# deadlock. Each mutant removes one guarantee in the DLL and must fail its case.
+# deadlock. It also counts the backings in the D3D12 budget, keeps a buffer a list copy wrote, and defers
+# XMem placements to the mesh XMem lease path when that is on. Each mutant removes one guarantee in the
+# DLL and must fail its case.
 add_executable(linear_buffer_backing_check tests/linear_buffer_backing_check.cpp)
 target_include_directories(linear_buffer_backing_check PRIVATE tests)
 target_compile_features(linear_buffer_backing_check PRIVATE cxx_std_17)
