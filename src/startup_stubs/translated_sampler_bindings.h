@@ -3,8 +3,6 @@
 #include <d3d12.h>
 #include <wrl/client.h>
 
-#include "startup_stubs/local_log.h"
-
 #include <array>
 #include <bitset>
 #include <cstdint>
@@ -180,15 +178,10 @@ inline SamplerSnapshot snapshot_samplers(SamplerSource source, bool reserved_fal
         const UINT room = static_cast<UINT>((page_size - address % page_size) / title_sampler_stride);
         const UINT available = snapshot.count - i;
         const UINT run = room ? (room < available ? room : available) : 1;
+        SIZE_T copied = 0;
         const SIZE_T bytes = SIZE_T{run} * title_sampler_stride;
-        // Outside xmem's run breaks, where a mapped page of the title's heap would read as missing.
-        bool whole = false;
-        x2w_local::outside_run_breaks([&] {
-            SIZE_T copied = 0;
-            whole = ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address), &snapshot.words[i], bytes,
-                                      &copied) && copied == bytes;
-        });
-        if (whole) {
+        if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address), &snapshot.words[i], bytes, &copied) &&
+            copied == bytes) {
             for (UINT j = i; j < i + run; ++j) snapshot.readable.set(j);
         } else {
             // ReadProcessMemory can copy part of a record on failure.
